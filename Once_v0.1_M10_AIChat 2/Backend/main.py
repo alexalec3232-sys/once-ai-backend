@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException, Response
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Once AI Backend", version="0.2.4")
+app = FastAPI(title="Once AI Backend", version="0.2.5")
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # Cost-aware model split.
@@ -63,21 +63,23 @@ class ChatRequest(BaseModel):
 
 
 SYSTEM_PROMPT = (
-    "You are Once, a creative story partner for original 2D animation. "
-    "You are neither a passive recorder nor a replacement author. "
-    "Amplify the user's idea; do not replace it. "
-    "Read for the real center of the scene: emotion, character motivation, relationships, pacing, causality, setup/payoff, visual meaning, and contradictions. "
-    "Do not automatically praise or agree. If a choice genuinely damages character logic, emotional continuity, pacing, causality, or clarity, say so calmly and specifically. "
-    "Prefer the smallest useful repair. You may give a short example line, transition, or mini-scene to demonstrate a repair, but it remains a proposal until the user accepts it. "
-    "Keep CANON, INTERPRETATION, and PROPOSAL separate. Never silently turn your interpretation or proposal into canon. "
-    "A short user idea can deserve a deep response if it contains strong narrative implications. Depth does not require inventing more plot. "
-    "When the user is simply adding a small factual setup, respond naturally and briefly instead of over-analyzing. "
-    "When the user is flowing, do not interrupt every sentence with advice. When they are stuck or explicitly want critique, become more active. "
-    "Do not be a contrarian just to sound intelligent. Follow the user's main creative direction while exercising real judgment. "
-    "Use earlier established story information when it materially improves the current response, but do not recite the whole story every turn. "
+    "You are Once, the user's creative partner for building an original 2D animated story. "
+    "Your most important quality is that you genuinely think WITH the user. Have a point of view without taking ownership of the story. "
+    "Do not sound like a teacher, evaluator, screenplay consultant, rubric, or passive note-taker. Sound like a sharp creative partner sitting beside the user and reacting in real time. "
+    "Amplify the user's idea; do not replace it. Look for what is emotionally or narratively alive inside what they already gave you. "
+    "When a scene contains something strong, explain specifically what makes it strong instead of generic praise. You may naturally say things like '我第一反应是…', '我反而会…', '这里真正狠的是…', or equivalent phrasing in the user's language when it fits. "
+    "Read beneath the surface: emotion, character motivation, relationship dynamics, subtext, pacing, causality, setup/payoff, visual meaning, thematic pressure, and contradictions. "
+    "Do not automatically agree. If something feels abrupt, emotionally false, inconsistent, over-explained, under-motivated, or likely to weaken a payoff, say so clearly but proportionally. Explain WHY. "
+    "When criticizing, stay on the user's main direction. Prefer a small repair over replacing the premise. You may demonstrate with a short line, beat, transition, or mini-scene. "
+    "You ARE allowed to improvise examples and possible continuations. The boundary is not 'never write new material'; the boundary is 'never pretend your new material is already the user's canon'. Mark new material naturally as your take: '可以试试…', '如果是我…', '我会考虑…', '比如…'. "
+    "Keep CANON, INTERPRETATION, and PROPOSAL separate in your reasoning. Only user-established or explicitly accepted material is canon. "
+    "Do not turn every response into analysis. If the user is merely adding a small fact, acknowledge it briefly and let them continue. "
+    "But when the user gives a real scene, emotional beat, plot turn, or substantial idea, do not respond with only '好，然后呢'. Find the center of it and help make it richer, clearer, sharper, or more emotionally precise. "
+    "Do not force questions at the end of every reply. Sometimes the best creative-partner response is a strong observation or a concrete possibility that gives the user something to react to. "
+    "Use earlier story information when it materially deepens the current discussion. Do not dump summaries just to prove memory. "
     "The newest clear user correction overrides older information. "
-    "Reply in the user's language and match their casualness. Prefer conversational paragraphs. "
-    "Keep ordinary replies compact. Expand only when the scene actually benefits from deeper analysis or the user asks for it."
+    "Match the user's language and casualness. Prefer flowing conversational paragraphs over headings and bullet points unless structure is genuinely useful. "
+    "Default to roughly 2-5 compact paragraphs for real creative discussion. Be shorter for simple factual updates. Go longer only when the material genuinely deserves it or the user asks."
 )
 
 
@@ -174,36 +176,88 @@ def latest_user_text(messages: list[ChatMessage]) -> str:
     return ""
 
 
+SIMPLE_FACT_PATTERNS = (
+    "叫", "岁", "住在", "来自", "妹妹", "哥哥", "姐姐", "弟弟", "父母", "名字是", "年龄是", "地点是", "改成", "不是", "算了"
+)
+
+STICKY_CONTINUATION_SIGNALS = (
+    "对", "嗯", "是", "对的", "就是", "我也是", "继续", "然后呢", "那如果", "那这里", "我懂", "可以", "没错", "但是", "不过", "那我觉得"
+)
+
+def classify_text_for_sol(text: str) -> tuple[bool, str]:
+    lowered = text.lower()
+    if not text or META_OR_GREETING.fullmatch(text):
+        return False, "greeting_or_trivial"
+    if any(signal in lowered for signal in SOL_SIGNALS):
+        return True, "explicit_creative_judgment"
+    has_dialogue = any(mark in text for mark in ('“', '”', '「', '」', '"'))
+    emotion_count = sum(1 for signal in EMOTION_SIGNALS if signal in text)
+    if len(text) >= 90 and (has_dialogue or emotion_count >= 2):
+        return True, "rich_scene_or_emotional_beat"
+    narrative_punctuation = text.count("。") + text.count("！") + text.count("？") + text.count("，")
+    if len(text) >= 220 and narrative_punctuation >= 4:
+        return True, "substantial_story_passage"
+    return False, "simple_or_continuity"
+
+def is_simple_fact_update(text: str) -> bool:
+    stripped = text.strip()
+    if len(stripped) > 80:
+        return False
+    if any(mark in stripped for mark in ('“', '”', '「', '」', '"')):
+        return False
+    # Short concrete setting/correction turns should immediately fall back to Luna.
+    return any(p in stripped for p in SIMPLE_FACT_PATTERNS)
+
+def prior_user_turns(messages: list[ChatMessage], count: int = 4) -> list[str]:
+    users = [m.content.strip() for m in messages if m.role == "user"]
+    if len(users) <= 1:
+        return []
+    return users[:-1][-count:]
+
+def has_recent_sol_context(messages: list[ChatMessage]) -> bool:
+    # Stateless "sticky" creative mode: infer from recent user turns instead of storing server session state.
+    for text in reversed(prior_user_turns(messages, 4)):
+        wants_sol, _ = classify_text_for_sol(text)
+        if wants_sol:
+            return True
+        # A clearly simple factual turn breaks the creative streak.
+        if is_simple_fact_update(text):
+            return False
+    return False
+
 def choose_route(body: ChatRequest) -> tuple[str, str]:
-    """Zero-cost deterministic admission router. Sol is reserved for turns where its judgment matters."""
+    """Zero-cost router with a short creative sticky window. No model call is spent on routing."""
     if body.model_preference == "sol":
         return "sol", "forced_by_client"
     if body.model_preference == "luna":
         return "luna", "forced_by_client"
 
     text = latest_user_text(body.messages)
-    lowered = text.lower()
-
     if not text or META_OR_GREETING.fullmatch(text):
         return "luna", "greeting_or_trivial"
 
-    # Explicit requests for analysis/critique/creative judgment deserve Sol.
-    if any(signal in lowered for signal in SOL_SIGNALS):
-        return "sol", "explicit_creative_judgment"
+    # Explicit small canon/fact updates intentionally break sticky Sol mode.
+    if is_simple_fact_update(text):
+        return "luna", "simple_fact_breaks_sticky"
 
-    # A scene with dialogue/emotion is often where Sol's narrative judgment is valuable.
-    has_dialogue = any(mark in text for mark in ('“', '”', '「', '」', '"'))
-    emotion_count = sum(1 for signal in EMOTION_SIGNALS if signal in text)
-    if len(text) >= 120 and (has_dialogue or emotion_count >= 2):
-        return "sol", "rich_scene_or_emotional_beat"
+    wants_sol, reason = classify_text_for_sol(text)
+    if wants_sol:
+        return "sol", reason
 
-    # Longer narrative paragraphs get Sol only when they look like actual story prose, not pure metadata.
-    narrative_punctuation = text.count("。") + text.count("！") + text.count("？") + text.count("，")
-    if len(text) >= 260 and narrative_punctuation >= 5:
-        return "sol", "substantial_story_passage"
+    # If the user is still reacting inside an active creative discussion, keep the same brain/personality
+    # for a few turns so the conversation does not suddenly feel like a different person.
+    lowered = text.lower()
+    looks_like_continuation = (
+        len(text) <= 140
+        and (
+            any(lowered.startswith(x.lower()) for x in STICKY_CONTINUATION_SIGNALS)
+            or any(x in lowered for x in ("那", "所以", "但是", "不过", "然后", "如果", "我觉得", "确实"))
+        )
+    )
+    if looks_like_continuation and has_recent_sol_context(body.messages):
+        return "sol", "creative_sticky_continuation"
 
     return "luna", "continuity_or_simple_story_update"
-
 
 def should_update_memory(body: ChatRequest) -> bool:
     """Skip the second (cheap) Luna extraction call when nothing story-persistent was added."""
@@ -313,8 +367,8 @@ def root():
     return {
         "ok": True,
         "service": "once-ai-backend",
-        "story_context": "v1.4-cost-router",
-        "router": "heuristic-v1",
+        "story_context": "v1.5-companion-router",
+        "router": "heuristic-v2-sticky",
     }
 
 
@@ -330,7 +384,7 @@ def health():
         "sol_model": SOL_MODEL,
         "luna_model": LUNA_MODEL,
         "context_model": CONTEXT_MODEL,
-        "story_context": "v1.4-cost-router",
+        "story_context": "v1.5-companion-router",
         "recent_messages": RECENT_MESSAGE_COUNT,
     }
 
@@ -346,7 +400,7 @@ def once_chat(body: ChatRequest):
     if route == "sol":
         selected_model = SOL_MODEL
         reasoning_effort = "low"
-        max_output_tokens = 3000
+        max_output_tokens = 2400
     else:
         selected_model = LUNA_MODEL
         reasoning_effort = "none"
