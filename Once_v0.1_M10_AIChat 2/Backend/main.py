@@ -386,7 +386,7 @@ def root():
         "service": "once-ai-backend",
         "story_context": "v1.5-companion-router",
         "router": "heuristic-v2-sticky",
-        "project_layer": "m12-model-plumbing",
+        "project_layer": "m13-shot-screenplay",
     }
 
 
@@ -407,7 +407,7 @@ def health():
         "live_model": LIVE_MODEL,
         "draft_image_model": DRAFT_IMAGE_MODEL,
         "render_image_model": RENDER_IMAGE_MODEL,
-        "project_prepare": "v1",
+        "project_prepare": "v2-shot-screenplay",
     }
 
 
@@ -490,10 +490,21 @@ def once_chat(body: ChatRequest):
 
 # ---------- Project preparation ----------
 
+class ScreenplayShot(BaseModel):
+    number: int = Field(ge=1, le=200)
+    visual: str = Field(min_length=1, max_length=2400)
+
+
+class ScreenplaySummary(BaseModel):
+    title: str = Field(default="", max_length=200)
+    shots: list[ScreenplayShot] = Field(default_factory=list, max_length=200)
+
+
 class ProjectPrepareRequest(BaseModel):
     nickname: str = ""
     messages: list[ChatMessage] = Field(default_factory=list, max_length=120)
     story_state: StoryState | None = None
+    previous_screenplay: ScreenplaySummary | None = None
 
 
 class ProjectBrief(BaseModel):
@@ -539,20 +550,36 @@ def prepare_project(body: ProjectPrepareRequest):
         raise HTTPException(status_code=400, detail="还没有可整理的故事内容")
 
     prompt = (
-        "You are preparing a production brief for Once, an AI-assisted 2D animation workspace. "
-        "Read the user's established story and current intent deeply, but do not invent canon. "
-        "Your job is to make the downstream voice model and image models understand what the user is trying to create before project mode starts. "
-        "Return exactly one valid JSON object matching this shape: "
-        "{project_summary:string, creative_intent:string, current_story_position:string, "
-        "visual_direction:[string], characters:[string], scene_goals:[string], continuity_constraints:[string], "
-        "emotional_targets:[string], open_decisions:[string], voice_context:string, image_context:string}. "
-        "The image_context should describe visual continuity, camera/composition tendencies, character consistency requirements, and the fixed original stylized 2D action-animation baseline. "
-        "The voice_context should tell a realtime creative partner what is already established, what the user is currently trying to make, and what must not be silently changed. "
-        "Do not add a new plot twist merely because it seems interesting."
+        "You are Once's SHOT SCREENPLAY COMPILER for an original 2D animation project. "
+        "This is not a normal chat reply and not a story review. Convert the user's established story into a concrete, drawable sequence of shots. "
+        "The visible screenplay must describe only what a camera can directly record: environment, characters, body movement, facial movement, props, spatial relationships, camera distance/movement, literal dialogue already supported by the story, and directly audible actions when necessary. "
+        "Never write philosophy, metaphor, symbolism, themes, moral meaning, hidden psychology, abstract emotion labels, or invisible intent in the visible shots. "
+        "Forbidden examples include: '他终于意识到自己逃不掉了', '这一幕象征孤独', '气氛充满宿命感'. "
+        "Rewrite such ideas into observable behavior, for example: '男主停下，肩膀起伏，抬头看向前方三人'. "
+        "One shot should contain one clear visual beat. Split the sequence whenever composition, action focus, location, or camera purpose materially changes. "
+        "Do not compress several important actions into one giant shot. "
+        "You may add neutral cinematic bridge shots that do NOT change canon, such as an insect in the desert, wind moving sand, a shoe striking the ground, dust crossing frame, or a wide establishing view. "
+        "These additions are allowed only to make the existing action filmable; do not invent new plot events, powers, relationships, lore, injuries, dialogue, or outcomes. "
+        "If the user's story stops, the screenplay stops there. Do not continue the plot beyond the established endpoint. "
+        "Number shots sequentially starting at 1. Keep each visual description concrete and concise enough that an image model could draw it without interpreting abstract prose. "
+        "If a previous screenplay is provided, treat this as UPDATE SCREENPLAY: preserve useful shots and revise them to match the newest conversation and canon. "
+        "If the user clearly says they are switching to a new story, project, title, or scene unrelated to the prior screenplay, discard the old screenplay instead of blending the two stories. The newest explicit project switch always wins. "
+        "In the same JSON, also produce a hidden project_brief for downstream realtime voice and image models. The hidden brief MAY contain narrative intent, emotional targets, continuity rules, and unresolved decisions because the user does not see that part. "
+        "Return exactly one valid JSON object with this exact top-level shape: "
+        "{project_brief:{project_summary:string,creative_intent:string,current_story_position:string,visual_direction:[string],characters:[string],scene_goals:[string],continuity_constraints:[string],emotional_targets:[string],open_decisions:[string],voice_context:string,image_context:string},"
+        "screenplay:{title:string,shots:[{number:int,visual:string}]}}. "
+        "The screenplay title should use the established project/story title when known; otherwise use '镜头剧本'. "
+        "The hidden image_context and voice_context must understand the exact shot plan and must not silently rewrite the user's canon."
     )
+
+    previous_text = "None"
+    if body.previous_screenplay is not None:
+        previous_text = json.dumps(body.previous_screenplay.model_dump(), ensure_ascii=False)
+
     evidence = (
         "PERSISTENT STORY STATE:\n" + compact_story_state(body.story_state) +
-        "\n\nRECENT PROJECT CONVERSATION:\n" + _project_history_for_prompt(body.messages)
+        "\n\nPREVIOUS SCREENPLAY IF ANY:\n" + trim_text(previous_text, 30000) +
+        "\n\nPROJECT CONVERSATION:\n" + _project_history_for_prompt(body.messages)
     )
 
     try:
@@ -560,20 +587,33 @@ def prepare_project(body: ProjectPrepareRequest):
             model=SOL_MODEL,
             reasoning={"effort": "low"},
             instructions=prompt,
-            input=[{"role": "user", "content": "Return valid JSON only.\n" + evidence}],
+            input=[{"role": "user", "content": "Return valid JSON only. Compile the shot screenplay now.\n" + evidence}],
             store=False,
-            max_output_tokens=2600,
+            max_output_tokens=6000,
         )
         raw = _clean_json_text(response.output_text or "")
         decoded = json.loads(raw)
-        brief = ProjectBrief.model_validate(decoded)
+        brief = ProjectBrief.model_validate(decoded.get("project_brief", {}))
+        screenplay = ScreenplaySummary.model_validate(decoded.get("screenplay", {}))
+        if not screenplay.shots:
+            raise ValueError("模型没有生成镜头")
+
+        normalized_shots = [
+            ScreenplayShot(number=index, visual=shot.visual.strip())
+            for index, shot in enumerate(screenplay.shots, start=1)
+            if shot.visual.strip()
+        ]
+        if not normalized_shots:
+            raise ValueError("模型没有生成有效镜头")
+        screenplay = ScreenplaySummary(title=screenplay.title.strip(), shots=normalized_shots)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail="剧本整理失败：" + str(exc)) from exc
+        raise HTTPException(status_code=502, detail="镜头剧本整理失败：" + str(exc)) from exc
 
     return {
         "ok": True,
         "model": SOL_MODEL,
         "project_brief": brief.model_dump(),
+        "screenplay": screenplay.model_dump(),
         "story_revision": (body.story_state.revision if body.story_state else 0),
     }
 
