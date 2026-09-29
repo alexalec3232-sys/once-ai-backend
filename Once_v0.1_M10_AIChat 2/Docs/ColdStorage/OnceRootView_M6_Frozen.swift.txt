@@ -1,0 +1,2568 @@
+import SwiftUI
+import Foundation
+import UIKit
+import PencilKit
+import Combine
+import AVFoundation
+
+struct OnceRootView: View {
+    private let messages = [
+        "你好，我是Once。我负责陪你把你脑子里的画面，一点点真的变成属于你的动漫世界。",
+        "你不用会画，也不用一开始就知道该怎么表达。你可以说、可以画、可以乱来。我们一起试，直到那个画面越来越像你想的那一个。",
+        "我不会替你创作，也不会假装什么都懂。这个世界还是你的。我只负责陪你，把它做出来。"
+    ]
+
+    @State private var orbVisible = false
+    @State private var hasStarted = false
+    @State private var currentMessageIndex = 0
+    @State private var visibleCharacterIndexes: Set<Int> = []
+    @State private var isAnimatingText = false
+
+    @State private var showNamePrompt = false
+    @State private var namePromptIsClear = false
+    @State private var nickname = ""
+    @State private var isEndingIntro = false
+    @State private var blackScreenOpacity: Double = 0
+    @State private var showWorkspace = false
+    @State private var appScreen: OnceAppScreen = .home
+    @StateObject private var projectStore = OnceProjectStore()
+    @StateObject private var aiService = OnceAIService()
+    @State private var workspaceOpacity: Double = 0
+    @State private var workspaceBlur: CGFloat = 14
+
+    @FocusState private var isNameFieldFocused: Bool
+    @AppStorage("oncePreferredName") private var preferredName = ""
+
+    var body: some View {
+        ZStack {
+            introLayer
+
+            Color.black
+                .ignoresSafeArea()
+                .opacity(blackScreenOpacity)
+                .allowsHitTesting(blackScreenOpacity > 0.01 && !showWorkspace)
+
+            if showWorkspace {
+                OnceAppShell(
+                    screen: $appScreen,
+                    projectStore: projectStore,
+                    aiService: aiService
+                )
+                .opacity(workspaceOpacity)
+                .blur(radius: workspaceBlur)
+            }
+        }
+        .ignoresSafeArea(.keyboard)
+        .preferredColorScheme(.light)
+    }
+
+    private var introLayer: some View {
+        GeometryReader { proxy in
+            let initialOrbY = proxy.size.height * 0.50
+            let activeOrbY = proxy.size.height * 0.285
+            let activeOrbSize: CGFloat = 68
+            let textTop = activeOrbY + (activeOrbSize / 2) + 42
+            let namePromptY = max(proxy.size.height * 0.665, textTop + 205)
+
+            ZStack {
+                Color.white
+                    .ignoresSafeArea()
+
+                if !isEndingIntro {
+                    VStack {
+                        HStack {
+                            Button(action: skipIntro) {
+                                Text("跳过")
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(Color.black.opacity(0.50))
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 8)
+                                    .background(
+                                        Capsule()
+                                            .fill(Color.black.opacity(0.055))
+                                    )
+                                    .overlay {
+                                        Capsule()
+                                            .stroke(Color.black.opacity(0.07), lineWidth: 0.7)
+                                    }
+                            }
+                            .buttonStyle(.plain)
+                            .contentShape(Capsule())
+
+                            Spacer()
+                        }
+
+                        Spacer()
+                    }
+                    .padding(.leading, max(proxy.safeAreaInsets.leading, 16) + 2)
+                    .padding(.top, max(proxy.safeAreaInsets.top, 10) + 2)
+                    .zIndex(20)
+                }
+
+                Circle()
+                    .fill(.black)
+                    .frame(
+                        width: hasStarted ? activeOrbSize : 92,
+                        height: hasStarted ? activeOrbSize : 92
+                    )
+                    .opacity(orbVisible ? 1 : 0)
+                    .blur(radius: orbVisible ? 0 : 10)
+                    .scaleEffect(orbVisible ? 1 : 0.82)
+                    .position(
+                        x: proxy.size.width / 2,
+                        y: hasStarted ? activeOrbY : initialOrbY
+                    )
+                    .animation(.easeOut(duration: 1.15), value: orbVisible)
+                    .animation(.spring(response: 0.58, dampingFraction: 0.84), value: hasStarted)
+
+                if hasStarted {
+                    GlyphRevealText(
+                        text: messages[currentMessageIndex],
+                        visibleIndexes: visibleCharacterIndexes
+                    )
+                    .frame(maxWidth: min(proxy.size.width - 54, 430))
+                    .frame(
+                        maxWidth: .infinity,
+                        maxHeight: .infinity,
+                        alignment: .top
+                    )
+                    .padding(.top, textTop)
+                }
+
+                if !showNamePrompt && !isEndingIntro {
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            handleIntroTap()
+                        }
+                }
+
+                if showNamePrompt && !isEndingIntro {
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            finishNameEntryIfPossible()
+                        }
+
+                    NamePromptCard(
+                        nickname: $nickname,
+                        isFocused: $isNameFieldFocused
+                    )
+                    .frame(maxWidth: min(proxy.size.width - 44, 430))
+                    .position(
+                        x: proxy.size.width / 2,
+                        y: isNameFieldFocused ? min(namePromptY, proxy.size.height * 0.57) : namePromptY
+                    )
+                    .animation(.easeInOut(duration: 0.30), value: isNameFieldFocused)
+                    .opacity(namePromptIsClear ? 1 : 0)
+                    .blur(radius: namePromptIsClear ? 0 : 14)
+                    .scaleEffect(namePromptIsClear ? 1 : 0.985)
+                    .allowsHitTesting(namePromptIsClear)
+                }
+            }
+            .onAppear {
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(280))
+                    orbVisible = true
+                }
+            }
+        }
+    }
+
+    private func handleIntroTap() {
+        guard orbVisible, !isAnimatingText, !showNamePrompt, !isEndingIntro else { return }
+
+        if !hasStarted {
+            let generator = UIImpactFeedbackGenerator(style: .light)
+            generator.prepare()
+            generator.impactOccurred(intensity: 0.55)
+
+            withAnimation(.spring(response: 0.58, dampingFraction: 0.84)) {
+                hasStarted = true
+            }
+
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(520))
+                await revealCurrentMessage()
+            }
+            return
+        }
+
+        guard currentMessageIndex < messages.count - 1 else { return }
+
+        Task { @MainActor in
+            await hideCurrentMessage()
+            currentMessageIndex += 1
+            try? await Task.sleep(for: .milliseconds(260))
+            await revealCurrentMessage()
+        }
+    }
+
+    @MainActor
+    private func revealCurrentMessage() async {
+        isAnimatingText = true
+        visibleCharacterIndexes.removeAll()
+
+        let count = Array(messages[currentMessageIndex]).count
+        guard count > 0 else {
+            isAnimatingText = false
+            return
+        }
+
+        for index in 0..<count {
+            withAnimation(.easeOut(duration: 0.34)) {
+                _ = visibleCharacterIndexes.insert(index)
+            }
+            try? await Task.sleep(for: .milliseconds(42))
+        }
+
+        try? await Task.sleep(for: .milliseconds(220))
+        isAnimatingText = false
+
+        if currentMessageIndex == messages.count - 1 {
+            await presentNamePrompt()
+        }
+    }
+
+    @MainActor
+    private func hideCurrentMessage() async {
+        isAnimatingText = true
+
+        let count = Array(messages[currentMessageIndex]).count
+        guard count > 0 else {
+            isAnimatingText = false
+            return
+        }
+
+        for index in stride(from: count - 1, through: 0, by: -1) {
+            withAnimation(.easeIn(duration: 0.27)) {
+                visibleCharacterIndexes.remove(index)
+            }
+            try? await Task.sleep(for: .milliseconds(28))
+        }
+
+        try? await Task.sleep(for: .milliseconds(180))
+        visibleCharacterIndexes.removeAll()
+        isAnimatingText = false
+    }
+
+    @MainActor
+    private func presentNamePrompt() async {
+        try? await Task.sleep(for: .milliseconds(520))
+        guard !showNamePrompt, !isEndingIntro else { return }
+
+        showNamePrompt = true
+        namePromptIsClear = false
+
+        try? await Task.sleep(for: .milliseconds(30))
+        withAnimation(.easeOut(duration: 0.72)) {
+            namePromptIsClear = true
+        }
+    }
+
+    private func finishNameEntryIfPossible() {
+        let cleaned = nickname.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !cleaned.isEmpty else {
+            isNameFieldFocused = false
+            return
+        }
+
+        preferredName = cleaned
+        isNameFieldFocused = false
+        isEndingIntro = true
+
+        Task { @MainActor in
+            withAnimation(.easeInOut(duration: 0.62)) {
+                namePromptIsClear = false
+            }
+
+            try? await Task.sleep(for: .milliseconds(680))
+            showNamePrompt = false
+
+            try? await Task.sleep(for: .milliseconds(180))
+            withAnimation(.easeInOut(duration: 2.1)) {
+                blackScreenOpacity = 1
+            }
+
+            try? await Task.sleep(for: .milliseconds(2450))
+            appScreen = .home
+            showWorkspace = true
+            workspaceOpacity = 0
+            workspaceBlur = 14
+
+            try? await Task.sleep(for: .milliseconds(80))
+            withAnimation(.easeOut(duration: 1.35)) {
+                workspaceOpacity = 1
+                workspaceBlur = 0
+            }
+        }
+    }
+
+    private func skipIntro() {
+        guard !isEndingIntro, !showWorkspace else { return }
+
+        isNameFieldFocused = false
+        isEndingIntro = true
+
+        Task { @MainActor in
+            // Skip means skip: do not wait for the current glyph animation or
+            // name card to finish. The whole intro is immediately swallowed by black.
+            withAnimation(.easeInOut(duration: 1.55)) {
+                blackScreenOpacity = 1
+                namePromptIsClear = false
+            }
+
+            try? await Task.sleep(for: .milliseconds(1800))
+            showNamePrompt = false
+            appScreen = .home
+            showWorkspace = true
+            workspaceOpacity = 0
+            workspaceBlur = 14
+
+            try? await Task.sleep(for: .milliseconds(80))
+            withAnimation(.easeOut(duration: 1.35)) {
+                workspaceOpacity = 1
+                workspaceBlur = 0
+            }
+        }
+    }
+}
+
+// MARK: - App routing & saved project list
+
+private enum OnceAppScreen: Equatable {
+    case home
+    case drawingEntry
+    case drawingLongPrep
+    case drawingFrames
+    case videoFrames
+}
+
+private enum OnceProjectKind: String, Codable, Equatable {
+    case drawingFrames = "画面帧"
+    case videoFrames = "视频帧"
+}
+
+private struct OnceProjectRecord: Identifiable, Codable {
+    let id: UUID
+    let name: String
+    let kind: OnceProjectKind
+    let createdAt: Date
+}
+
+private final class OnceProjectStore: ObservableObject {
+    @Published private(set) var projects: [OnceProjectRecord] = []
+
+    private let storageKey = "once.projects.v1"
+
+    init() {
+        load()
+    }
+
+    func addProject(name: String, kind: OnceProjectKind) {
+        let cleaned = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return }
+
+        projects.insert(
+            OnceProjectRecord(
+                id: UUID(),
+                name: cleaned,
+                kind: kind,
+                createdAt: Date()
+            ),
+            at: 0
+        )
+        save()
+    }
+
+    private func load() {
+        guard
+            let data = UserDefaults.standard.data(forKey: storageKey),
+            let decoded = try? JSONDecoder().decode([OnceProjectRecord].self, from: data)
+        else {
+            projects = []
+            return
+        }
+        projects = decoded
+    }
+
+    private func save() {
+        guard let data = try? JSONEncoder().encode(projects) else { return }
+        UserDefaults.standard.set(data, forKey: storageKey)
+    }
+}
+
+private struct OnceAppShell: View {
+    @Binding var screen: OnceAppScreen
+    @ObservedObject var projectStore: OnceProjectStore
+    @ObservedObject var aiService: OnceAIService
+
+    var body: some View {
+        Group {
+            switch screen {
+            case .home:
+                OnceProjectHomeView(
+                    projectStore: projectStore,
+                    openDrawingFrames: { screen = .drawingEntry },
+                    openVideoFrames: { screen = .videoFrames }
+                )
+            case .drawingEntry:
+                OnceDrawingModeChoiceView(
+                    onBack: { screen = .home },
+                    openShort: { screen = .drawingFrames },
+                    openLong: { screen = .drawingLongPrep }
+                )
+            case .drawingLongPrep:
+                OnceLongFormPrepView(
+                    onBack: { screen = .drawingEntry },
+                    onStartDrawing: { screen = .drawingFrames }
+                )
+            case .drawingFrames:
+                OnceWorkspaceView(
+                    projectStore: projectStore,
+                    aiService: aiService,
+                    onBack: { screen = .home }
+                )
+            case .videoFrames:
+                OnceVideoPlaceholderView(onBack: { screen = .home })
+            }
+        }
+        .animation(.easeInOut(duration: 0.24), value: screen)
+    }
+}
+
+// MARK: - Project home
+
+private struct OnceProjectHomeView: View {
+    @ObservedObject var projectStore: OnceProjectStore
+    let openDrawingFrames: () -> Void
+    let openVideoFrames: () -> Void
+
+    var body: some View {
+        GeometryReader { proxy in
+            let safeLeading = max(proxy.safeAreaInsets.leading, 18)
+            let safeTrailing = max(proxy.safeAreaInsets.trailing, 18)
+            let safeTop = max(proxy.safeAreaInsets.top, 12)
+            let safeBottom = max(proxy.safeAreaInsets.bottom, 12)
+
+            ZStack {
+                Color.black.ignoresSafeArea()
+
+                VStack(alignment: .leading, spacing: 18) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("Once")
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundStyle(Color.white.opacity(0.92))
+
+                        Spacer()
+                    }
+
+                    HStack(spacing: 16) {
+                        OnceHomeModeCard(
+                            title: "画面帧",
+                            subtitle: "画、改、和 Once 一起把每一张画面做出来",
+                            systemName: "square.and.pencil",
+                            action: openDrawingFrames
+                        )
+
+                        OnceHomeModeCard(
+                            title: "视频帧",
+                            subtitle: "把已经完成的画面变成真正的视频",
+                            systemName: "play.rectangle",
+                            action: openVideoFrames
+                        )
+                    }
+                    .frame(height: min(190, proxy.size.height * 0.34))
+
+                    Text("项目")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(Color.white.opacity(0.68))
+                        .padding(.top, 2)
+
+                    if projectStore.projects.isEmpty {
+                        VStack(spacing: 6) {
+                            Text("还没有项目")
+                                .font(.system(size: 14, weight: .medium))
+                                .foregroundStyle(Color.white.opacity(0.38))
+                            Text("从上面的画面帧开始，保存后的项目会出现在这里。")
+                                .font(.system(size: 11.5, weight: .regular))
+                                .foregroundStyle(Color.white.opacity(0.22))
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        ScrollView(.vertical, showsIndicators: false) {
+                            LazyVStack(spacing: 9) {
+                                ForEach(projectStore.projects) { project in
+                                    OnceProjectRow(project: project)
+                                }
+                            }
+                            .padding(.bottom, 8)
+                        }
+                    }
+                }
+                .padding(.leading, safeLeading + 10)
+                .padding(.trailing, safeTrailing + 10)
+                .padding(.top, safeTop + 8)
+                .padding(.bottom, safeBottom + 6)
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+}
+
+private struct OnceHomeModeCard: View {
+    let title: String
+    let subtitle: String
+    let systemName: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            ZStack(alignment: .topLeading) {
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .fill(Color.white)
+
+                VStack(alignment: .leading, spacing: 9) {
+                    Image(systemName: systemName)
+                        .font(.system(size: 19, weight: .medium))
+                        .foregroundStyle(Color.black.opacity(0.78))
+
+                    Spacer(minLength: 4)
+
+                    Text(title)
+                        .font(.system(size: 24, weight: .semibold))
+                        .foregroundStyle(Color.black.opacity(0.90))
+
+                    Text(subtitle)
+                        .font(.system(size: 11.5, weight: .regular))
+                        .foregroundStyle(Color.black.opacity(0.40))
+                        .multilineTextAlignment(.leading)
+                        .lineLimit(2)
+                }
+                .padding(20)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct OnceProjectRow: View {
+    let project: OnceProjectRecord
+
+    var body: some View {
+        HStack(spacing: 12) {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.white.opacity(0.08))
+                .frame(width: 48, height: 34)
+                .overlay {
+                    Image(systemName: project.kind == .drawingFrames ? "square.and.pencil" : "play.rectangle")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Color.white.opacity(0.56))
+                }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(project.name)
+                    .font(.system(size: 13.5, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.88))
+                    .lineLimit(1)
+
+                Text(project.kind.rawValue)
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(Color.white.opacity(0.35))
+            }
+
+            Spacer()
+
+            Text(project.createdAt.formatted(date: .abbreviated, time: .shortened))
+                .font(.system(size: 9.5, weight: .regular))
+                .foregroundStyle(Color.white.opacity(0.26))
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 54)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.white.opacity(0.045))
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.white.opacity(0.055), lineWidth: 0.7)
+        }
+    }
+}
+
+// MARK: - Drawing frame entry flow
+
+private struct OnceDrawingModeChoiceView: View {
+    let onBack: () -> Void
+    let openShort: () -> Void
+    let openLong: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                HStack {
+                    Button(action: onBack) {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(Color.white.opacity(0.84))
+                            .frame(width: 36, height: 32)
+                            .background(
+                                Capsule(style: .continuous)
+                                    .fill(Color.white.opacity(0.07))
+                            )
+                    }
+                    .buttonStyle(.plain)
+
+                    Spacer()
+
+                    Text("画面帧")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Color.white.opacity(0.42))
+
+                    Spacer()
+
+                    Color.clear.frame(width: 36, height: 32)
+                }
+                .padding(.horizontal, 18)
+                .padding(.top, 14)
+
+                Spacer()
+
+                VStack(spacing: 16) {
+                    Text("你想先从哪一种方式开始？")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(Color.white.opacity(0.92))
+
+                    Text("短视频更直接，马上进入画面帧工作区。长视频会先把你的故事或灵感整理成草稿剧本，再开始一起画。")
+                        .font(.system(size: 12.5, weight: .regular))
+                        .foregroundStyle(Color.white.opacity(0.36))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 520)
+
+                    HStack(spacing: 16) {
+                        OnceHomeModeCard(
+                            title: "短视频",
+                            subtitle: "直接进入画面帧工作区，适合先做单个画面、短镜头或小片段。",
+                            systemName: "sparkles.tv",
+                            action: openShort
+                        )
+
+                        OnceHomeModeCard(
+                            title: "长视频",
+                            subtitle: "先把剧本、段落或灵感整理成草稿剧本，再慢慢拆成具体画面。",
+                            systemName: "text.document",
+                            action: openLong
+                        )
+                    }
+                    .frame(height: 210)
+                }
+
+                Spacer()
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+}
+
+private struct OnceLongFormPrepView: View {
+    let onBack: () -> Void
+    let onStartDrawing: () -> Void
+
+    @State private var storyText: String = ""
+    @State private var draftScript: String = ""
+    @State private var companionMessage: String = "说来听听，我帮你把它拆分成具体流程，然后等会开始一起做。"
+    @State private var enteringWorkspace = false
+    @State private var showReadyOrb = false
+    @State private var keyboardHeight: CGFloat = 0
+
+    @FocusState private var isStoryFocused: Bool
+
+    var body: some View {
+        GeometryReader { proxy in
+            let safeTop = max(proxy.safeAreaInsets.top, 8)
+            let safeBottom = max(proxy.safeAreaInsets.bottom, 8)
+            let safeLeading = max(proxy.safeAreaInsets.leading, 14)
+            let safeTrailing = max(proxy.safeAreaInsets.trailing, 14)
+            let pageHeight = max(260, proxy.size.height - safeTop - safeBottom - 8)
+            let leftWidth = min(300, max(235, proxy.size.width * 0.26))
+
+            ZStack {
+                Color.black.ignoresSafeArea()
+
+                if !enteringWorkspace {
+                    HStack(spacing: 18) {
+                        draftScriptPanel
+                            .frame(width: leftWidth, height: pageHeight)
+
+                        mainIdeaPanel(availableHeight: pageHeight)
+                            .frame(maxWidth: .infinity, maxHeight: pageHeight)
+                    }
+                    .padding(.leading, safeLeading + 4)
+                    .padding(.trailing, safeTrailing + 4)
+                    .padding(.top, safeTop + 4)
+                    .padding(.bottom, safeBottom + 4)
+                    .transition(.opacity)
+                }
+
+                if enteringWorkspace {
+                    Color.black.ignoresSafeArea()
+
+                    if showReadyOrb {
+                        VStack(spacing: 18) {
+                            Circle()
+                                .fill(Color.white)
+                                .frame(width: 78, height: 78)
+                                .shadow(color: .white.opacity(0.12), radius: 10)
+
+                            Text("点我一下，我现在开始陪你一起画。")
+                                .font(.system(size: 15, weight: .medium))
+                                .foregroundStyle(Color.white.opacity(0.88))
+                        }
+                        .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            onStartDrawing()
+                        }
+                    }
+                }
+
+                if !enteringWorkspace && isStoryFocused && keyboardHeight > 0 {
+                    keyboardActionBar
+                        .position(
+                            x: proxy.size.width * 0.73,
+                            y: max(44, proxy.size.height - keyboardHeight - 24)
+                        )
+                        .zIndex(30)
+                }
+            }
+        }
+        .ignoresSafeArea(.keyboard)
+        .preferredColorScheme(.dark)
+        .onChange(of: storyText) { newValue in
+            refreshDraftScript(with: newValue)
+        }
+        .onAppear {
+            refreshDraftScript(with: storyText)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
+            updateKeyboardHeight(from: note)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            withAnimation(.easeOut(duration: 0.20)) {
+                keyboardHeight = 0
+            }
+        }
+    }
+
+    private var canStart: Bool {
+        !storyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var draftScriptPanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("草稿剧本")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.62))
+
+                Spacer()
+            }
+            .frame(height: 28)
+
+            ScrollViewReader { reader in
+                ScrollView(.vertical, showsIndicators: true) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        Color.clear
+                            .frame(height: 1)
+                            .id("draft-script-top")
+
+                        Text(draftScript.isEmpty ? "等你开口以后，我会先在这里帮你实时整理出草稿剧本。" : draftScript)
+                            .font(.system(size: 12.5, weight: .regular))
+                            .foregroundStyle(Color.white.opacity(draftScript.isEmpty ? 0.28 : 0.86))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(14)
+                    }
+                }
+                .defaultScrollAnchor(.top)
+                .onChange(of: draftScript) { _ in
+                    DispatchQueue.main.async {
+                        reader.scrollTo("draft-script-top", anchor: .top)
+                    }
+                }
+                .onAppear {
+                    DispatchQueue.main.async {
+                        reader.scrollTo("draft-script-top", anchor: .top)
+                    }
+                }
+            }
+            .frame(maxHeight: .infinity)
+            .background(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(Color.white.opacity(0.05))
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(Color.white.opacity(0.08), lineWidth: 0.8)
+            }
+        }
+        .clipped()
+    }
+
+    private func mainIdeaPanel(availableHeight: CGFloat) -> some View {
+        let compact = availableHeight < 360 || isStoryFocused
+        let headerHeight: CGFloat = 32
+        let introHeight: CGFloat = compact ? 42 : 52
+        let messageHeight: CGFloat = compact ? 0 : 54
+        let bottomBarHeight: CGFloat = 38
+        let spacingTotal: CGFloat = compact ? 30 : 44
+        let editorHeight = max(112, min(230, availableHeight - headerHeight - introHeight - messageHeight - bottomBarHeight - spacingTotal))
+
+        return VStack(alignment: .leading, spacing: compact ? 8 : 11) {
+            HStack {
+                Button(action: onBack) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(Color.white.opacity(0.84))
+                        .frame(width: 36, height: 30)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(Color.white.opacity(0.07))
+                        )
+                }
+                .buttonStyle(.plain)
+
+                Spacer()
+
+                if isStoryFocused {
+                    Button {
+                        isStoryFocused = false
+                    } label: {
+                        Text("完成输入")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundStyle(Color.white.opacity(0.78))
+                            .padding(.horizontal, 12)
+                            .frame(height: 30)
+                            .background(
+                                Capsule(style: .continuous)
+                                    .fill(Color.white.opacity(0.07))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .frame(height: headerHeight)
+
+            HStack(spacing: 11) {
+                Circle()
+                    .fill(Color.white)
+                    .frame(width: compact ? 40 : 50, height: compact ? 40 : 50)
+
+                Text("告诉我你想做的，这样我才有思路陪你一起。")
+                    .font(.system(size: compact ? 14.5 : 16.5, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.92))
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.85)
+            }
+            .frame(height: introHeight, alignment: .leading)
+
+            TextEditor(text: $storyText)
+                .focused($isStoryFocused)
+                .scrollContentBackground(.hidden)
+                .padding(12)
+                .frame(maxWidth: .infinity)
+                .frame(height: editorHeight)
+                .background(
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                        .fill(Color.white)
+                )
+                .overlay(alignment: .topLeading) {
+                    if storyText.isEmpty {
+                        Text("告诉我你想做的，这样我才有思路陪你一起")
+                            .font(.system(size: 14.5, weight: .regular))
+                            .foregroundStyle(Color.black.opacity(0.26))
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 17)
+                            .allowsHitTesting(false)
+                    }
+                }
+                .foregroundStyle(Color.black.opacity(0.88))
+                .font(.system(size: 15, weight: .regular))
+
+            if !compact {
+                Text(companionMessage)
+                    .font(.system(size: 12.5, weight: .medium))
+                    .foregroundStyle(Color.white.opacity(0.72))
+                    .lineLimit(2)
+                    .padding(.horizontal, 13)
+                    .frame(maxWidth: .infinity, minHeight: messageHeight, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 15, style: .continuous)
+                            .fill(Color.white.opacity(0.07))
+                    )
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 15, style: .continuous)
+                            .stroke(Color.white.opacity(0.08), lineWidth: 0.8)
+                    }
+            }
+
+            HStack {
+                Button(action: beginReadyTransition) {
+                    Text("开始")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(canStart ? Color.black : Color.white.opacity(0.34))
+                        .padding(.horizontal, 19)
+                        .frame(height: 36)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(canStart ? Color.white : Color.white.opacity(0.08))
+                        )
+                }
+                .buttonStyle(.plain)
+                .disabled(!canStart)
+
+                Spacer()
+
+                Text("可以只写一句灵感，也可以粘贴完整剧本")
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(Color.white.opacity(0.26))
+                    .lineLimit(1)
+            }
+            .frame(height: bottomBarHeight)
+        }
+        .frame(maxWidth: .infinity, maxHeight: availableHeight, alignment: .topLeading)
+        .clipped()
+    }
+
+    private var keyboardActionBar: some View {
+        HStack(spacing: 8) {
+            Button {
+                isStoryFocused = false
+            } label: {
+                Text("收起键盘")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.84))
+                    .padding(.horizontal, 13)
+                    .frame(height: 34)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(Color.black.opacity(0.84))
+                    )
+                    .overlay {
+                        Capsule(style: .continuous)
+                            .stroke(Color.white.opacity(0.12), lineWidth: 0.7)
+                    }
+            }
+            .buttonStyle(.plain)
+
+            Button(action: beginReadyTransition) {
+                Text("开始")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(canStart ? Color.black : Color.white.opacity(0.34))
+                    .padding(.horizontal, 17)
+                    .frame(height: 34)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(canStart ? Color.white : Color.white.opacity(0.08))
+                    )
+            }
+            .buttonStyle(.plain)
+            .disabled(!canStart)
+        }
+        .padding(6)
+        .background(
+            Capsule(style: .continuous)
+                .fill(Color.black.opacity(0.76))
+        )
+        .overlay {
+            Capsule(style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 0.7)
+        }
+        .fixedSize()
+    }
+
+    private func updateKeyboardHeight(from notification: Notification) {
+        guard
+            let frameValue = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue
+        else { return }
+
+        let frame = frameValue.cgRectValue
+        let screenHeight = UIScreen.main.bounds.height
+        let newHeight = max(0, screenHeight - frame.minY)
+
+        withAnimation(.easeInOut(duration: 0.22)) {
+            keyboardHeight = newHeight
+        }
+    }
+
+    private func beginReadyTransition() {
+        guard canStart else { return }
+        isStoryFocused = false
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+
+        withAnimation(.easeInOut(duration: 0.65)) {
+            enteringWorkspace = true
+        }
+
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(700))
+            withAnimation(.easeOut(duration: 0.55)) {
+                showReadyOrb = true
+            }
+        }
+    }
+
+    private func refreshDraftScript(with input: String) {
+        let cleaned = input.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if cleaned.isEmpty {
+            draftScript = ""
+            companionMessage = "说来听听，我帮你把它拆分成具体流程，然后等会开始一起做。"
+            return
+        }
+
+        let shortIdea = cleaned.count < 36
+        let firstLine = cleaned.components(separatedBy: .newlines).first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? cleaned
+
+        companionMessage = shortIdea
+            ? "说来听听，我先帮你把这个感觉变成可操作的画面，再一起慢慢补完整。"
+            : "我先帮你整理成一个草稿剧本，把场景、人物和流程抓出来，等会开始一起做。"
+
+        let normalized = cleaned
+            .replacingOccurrences(of: "。", with: "。\n")
+            .replacingOccurrences(of: "！", with: "！\n")
+            .replacingOccurrences(of: "？", with: "？\n")
+
+        let chunks = normalized
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        let beatLines = chunks.prefix(5).enumerated().map { idx, line in
+            "Beat \(idx + 1) · \(line)"
+        }.joined(separator: "\n")
+
+        draftScript = """
+        核心想法
+        \(firstLine)
+
+        当前整理
+        \(shortIdea ? "这是一个灵感起点，我会先按画面感去拆。" : "这已经像一段故事了，我先把它抓成可继续扩展的草稿。")
+
+        可能的流程
+        \(beatLines.isEmpty ? "Beat 1 · 从一个画面开始。" : beatLines)
+
+        下一步
+        继续补人物、场景、情绪，或者直接点击开始，进去以后边画边改。
+        """
+    }
+}
+
+// MARK: - Drawing frame workspace
+
+private struct OnceWorkspaceView: View {
+    @ObservedObject var projectStore: OnceProjectStore
+    @ObservedObject var aiService: OnceAIService
+    let onBack: () -> Void
+
+    @StateObject private var mainCanvas = OnceDrawingController()
+    @StateObject private var draftCanvas = OnceDrawingController()
+
+    @State private var draftIsLarge = false
+    @State private var swapBlur: CGFloat = 0
+    @State private var isSwapping = false
+    @State private var focusedBoard: OnceBoardKind = .main
+
+    @State private var showAIConsole = false
+    @State private var showAISettings = false
+    @State private var aiHint: String? = nil
+
+    @State private var selectedImageFrame = 0
+    @State private var imageFrameCount = 6
+
+    @State private var showExportDialog = false
+    @State private var exportName = ""
+
+    var body: some View {
+        GeometryReader { proxy in
+            let safeLeading = max(proxy.safeAreaInsets.leading, 14)
+            let safeTrailing = max(proxy.safeAreaInsets.trailing, 14)
+            let safeTop = max(proxy.safeAreaInsets.top, 8)
+            let safeBottom = max(proxy.safeAreaInsets.bottom, 8)
+            let gap: CGFloat = 54
+            let topBarHeight: CGFloat = 42
+            let frameStripHeight: CGFloat = 62
+
+            let availableWidth = max(0, proxy.size.width - safeLeading - safeTrailing - gap)
+            let wideWidth = availableWidth * 0.715
+            let narrowWidth = availableWidth - wideWidth
+            let boardHeight = max(220, proxy.size.height - safeTop - safeBottom - topBarHeight - frameStripHeight - 38)
+
+            let leftKind: OnceBoardKind = draftIsLarge ? .draft : .main
+            let rightKind: OnceBoardKind = draftIsLarge ? .main : .draft
+            let boardTop = safeTop + topBarHeight
+            let swapButtonX = safeLeading + wideWidth + (gap / 2)
+            let centerY = boardTop + (boardHeight / 2)
+            let toolShelfX = focusedBoard == leftKind
+                ? safeLeading + (wideWidth / 2)
+                : safeLeading + wideWidth + gap + (narrowWidth / 2)
+
+            ZStack {
+                Color.black.ignoresSafeArea()
+
+                VStack(spacing: 0) {
+                    workspaceTopBar
+                        .frame(height: topBarHeight)
+
+                    HStack(alignment: .top, spacing: gap) {
+                        board(kind: leftKind)
+                            .frame(width: wideWidth, height: boardHeight)
+
+                        board(kind: rightKind)
+                            .frame(width: narrowWidth, height: boardHeight)
+                    }
+                    .animation(.easeInOut(duration: 0.46), value: draftIsLarge)
+
+                    Spacer(minLength: 0)
+
+                    OnceImageFrameStrip(
+                        selectedFrame: $selectedImageFrame,
+                        frameCount: imageFrameCount,
+                        onAdd: {
+                            imageFrameCount += 1
+                            selectedImageFrame = imageFrameCount - 1
+                        }
+                    )
+                    .frame(height: frameStripHeight)
+                }
+                .padding(.leading, safeLeading)
+                .padding(.trailing, safeTrailing)
+                .padding(.top, safeTop)
+                .padding(.bottom, safeBottom)
+
+                VStack(spacing: 18) {
+                    swapButton
+                    aiOrb
+                }
+                .position(x: swapButtonX, y: centerY)
+
+                toolShelf
+                    .frame(maxWidth: proxy.size.width)
+                    .position(
+                        x: toolShelfX,
+                        y: boardTop + boardHeight + 20
+                    )
+
+                if let aiHint {
+                    Text(aiHint)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(Color.white.opacity(0.86))
+                        .padding(.horizontal, 13)
+                        .padding(.vertical, 8)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(Color.white.opacity(0.10))
+                        )
+                        .overlay {
+                            Capsule(style: .continuous)
+                                .stroke(Color.white.opacity(0.12), lineWidth: 0.7)
+                        }
+                        .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                        .position(
+                            x: swapButtonX,
+                            y: boardTop + boardHeight + 20
+                        )
+                }
+
+                if showExportDialog {
+                    OnceExportDialog(
+                        name: $exportName,
+                        onCancel: {
+                            exportName = ""
+                            withAnimation(.easeOut(duration: 0.18)) {
+                                showExportDialog = false
+                            }
+                        },
+                        onSave: {
+                            projectStore.addProject(name: exportName, kind: .drawingFrames)
+                            exportName = ""
+                            withAnimation(.easeOut(duration: 0.18)) {
+                                showExportDialog = false
+                            }
+                        }
+                    )
+                    .transition(.opacity.combined(with: .scale(scale: 0.97)))
+                    .zIndex(50)
+                }
+
+                if showAIConsole || showAISettings {
+                    Color.black.opacity(0.52)
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            if showAISettings {
+                                withAnimation(.easeOut(duration: 0.18)) { showAISettings = false }
+                            } else {
+                                withAnimation(.easeOut(duration: 0.18)) { showAIConsole = false }
+                            }
+                        }
+                        .zIndex(70)
+                }
+
+                if showAIConsole {
+                    OnceAIConsoleCard(
+                        aiService: aiService,
+                        onClose: {
+                            withAnimation(.easeOut(duration: 0.18)) { showAIConsole = false }
+                        },
+                        onOpenSettings: {
+                            withAnimation(.easeOut(duration: 0.18)) { showAISettings = true }
+                        },
+                        onGenerateDraft: runDraftGeneration,
+                        onCommitToMain: runCommitToMain,
+                        onTestLive: testLiveSession
+                    )
+                    .zIndex(80)
+                    .transition(.opacity.combined(with: .scale(scale: 0.97)))
+                }
+
+                if showAISettings {
+                    OnceAISettingsCard(
+                        initialBaseURL: aiService.baseURL,
+                        initialAuthToken: aiService.authToken,
+                        onClose: {
+                            withAnimation(.easeOut(duration: 0.18)) { showAISettings = false }
+                        },
+                        onSave: { baseURL, token in
+                            aiService.updateConfiguration(baseURL: baseURL, authToken: token)
+                            withAnimation(.easeOut(duration: 0.18)) { showAISettings = false }
+                            showAIHint("AI 设置已保存。")
+                        }
+                    )
+                    .zIndex(81)
+                    .transition(.opacity.combined(with: .scale(scale: 0.97)))
+                }
+            }
+            .blur(radius: swapBlur)
+            .overlay {
+                if isSwapping {
+                    Color.black.opacity(0.03)
+                        .ignoresSafeArea()
+                        .allowsHitTesting(true)
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    private var workspaceTopBar: some View {
+        HStack {
+            Button(action: onBack) {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.84))
+                    .frame(width: 34, height: 30)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(Color.white.opacity(0.07))
+                    )
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("返回主页")
+
+            Spacer()
+
+            Text("画面帧")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(Color.white.opacity(0.42))
+
+            Spacer()
+
+            HStack(spacing: 8) {
+                Button {
+                    withAnimation(.easeOut(duration: 0.18)) {
+                        showAIConsole = true
+                    }
+                } label: {
+                    Text("AI")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Color.white.opacity(0.90))
+                        .padding(.horizontal, 13)
+                        .frame(height: 30)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(Color.white.opacity(0.09))
+                        )
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    exportName = ""
+                    withAnimation(.easeOut(duration: 0.18)) {
+                        showExportDialog = true
+                    }
+                } label: {
+                    Text("导出")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Color.white.opacity(0.90))
+                        .padding(.horizontal, 13)
+                        .frame(height: 30)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(Color.white.opacity(0.09))
+                        )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func board(kind: OnceBoardKind) -> some View {
+        let controller = kind == .main ? mainCanvas : draftCanvas
+
+        OnceBoardPanel(
+            kind: kind,
+            controller: controller,
+            isFocused: focusedBoard == kind,
+            onInteract: {
+                focusedBoard = kind
+            }
+        )
+        .id(kind)
+    }
+
+    private var swapButton: some View {
+        Button(action: swapBoards) {
+            ZStack {
+                Circle()
+                    .fill(Color.white.opacity(0.11))
+                    .overlay {
+                        Circle().stroke(Color.white.opacity(0.22), lineWidth: 0.8)
+                    }
+
+                Image(systemName: "arrow.left.arrow.right")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.86))
+            }
+            .frame(width: 34, height: 34)
+        }
+        .buttonStyle(.plain)
+        .disabled(isSwapping)
+        .accessibilityLabel("交换主画面和草稿")
+    }
+
+    private var aiOrb: some View {
+        Button(action: toggleAIConsole) {
+            ZStack {
+                Circle()
+                    .fill(Color.black)
+                    .overlay {
+                        Circle().stroke(Color.white.opacity(showAIConsole ? 0.56 : 0.24), lineWidth: showAIConsole ? 1.25 : 0.8)
+                    }
+                    .shadow(color: Color.white.opacity(showAIConsole ? 0.09 : 0.02), radius: 9)
+
+                Image(systemName: aiService.isWorking ? "ellipsis" : "waveform")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.92))
+            }
+            .frame(width: 42, height: 42)
+            .overlay(alignment: .bottom) {
+                Text("Once")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(Color.white.opacity(0.44))
+                    .offset(y: 17)
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("打开 Once AI")
+    }
+
+    private var toolShelf: some View {
+        let controller = focusedBoard == .main ? mainCanvas : draftCanvas
+
+        return HStack(spacing: 5) {
+            Text(focusedBoard.title)
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundStyle(Color.white.opacity(0.48))
+                .padding(.leading, 4)
+                .padding(.trailing, 4)
+
+            Divider()
+                .frame(height: 18)
+                .overlay(Color.white.opacity(0.12))
+
+            OnceToolButton(
+                systemName: "pencil.tip",
+                selected: controller.tool == .pen,
+                accessibility: "画笔"
+            ) {
+                controller.setTool(.pen)
+            }
+
+            OnceToolButton(
+                systemName: "eraser",
+                selected: controller.tool == .eraser,
+                accessibility: "橡皮"
+            ) {
+                controller.setTool(.eraser)
+            }
+
+            Divider()
+                .frame(height: 18)
+                .overlay(Color.white.opacity(0.12))
+
+            OnceToolButton(systemName: "arrow.uturn.backward", accessibility: "撤回") {
+                controller.undo()
+            }
+
+            OnceToolButton(systemName: "arrow.uturn.forward", accessibility: "重做") {
+                controller.redo()
+            }
+        }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 5)
+        .background(
+            Capsule(style: .continuous)
+                .fill(Color.black.opacity(0.72))
+        )
+        .overlay {
+            Capsule(style: .continuous)
+                .stroke(Color.white.opacity(0.10), lineWidth: 0.7)
+        }
+        .fixedSize()
+    }
+
+    private func swapBoards() {
+        guard !isSwapping else { return }
+        isSwapping = true
+
+        let impact = UIImpactFeedbackGenerator(style: .soft)
+        impact.prepare()
+        impact.impactOccurred(intensity: 0.65)
+
+        Task { @MainActor in
+            withAnimation(.easeIn(duration: 0.20)) {
+                swapBlur = 17
+            }
+            try? await Task.sleep(for: .milliseconds(220))
+
+            withAnimation(.easeInOut(duration: 0.46)) {
+                draftIsLarge.toggle()
+            }
+
+            try? await Task.sleep(for: .milliseconds(230))
+            withAnimation(.easeOut(duration: 0.34)) {
+                swapBlur = 0
+            }
+            try? await Task.sleep(for: .milliseconds(380))
+            isSwapping = false
+        }
+    }
+
+    private func toggleAIConsole() {
+        let impact = UIImpactFeedbackGenerator(style: .light)
+        impact.prepare()
+        impact.impactOccurred(intensity: 0.55)
+
+        withAnimation(.easeOut(duration: 0.18)) {
+            showAIConsole.toggle()
+        }
+        if showAIConsole {
+            showAIHint("你可以先用文字测试 Flare 和 Sunburst。Live 连接也已经预留好了。")
+        }
+    }
+
+    private func runDraftGeneration() {
+        Task {
+            do {
+                let effectivePrompt = "给我一个 Once 默认 2D 动作动画风格的测试草稿。"
+                try await aiService.generateDraft(
+                    prompt: effectivePrompt,
+                    selectedFrame: selectedImageFrame,
+                    mainController: mainCanvas,
+                    draftController: draftCanvas
+                )
+                focusedBoard = .draft
+                showAIHint("草稿已经生成到草稿区。")
+            } catch {
+                showAIHint(error.localizedDescription)
+            }
+        }
+    }
+
+    private func runCommitToMain() {
+        Task {
+            do {
+                let effectivePrompt = "把当前已经确认的草稿正式落到主画面，保持 Once 默认 2D 风格。"
+                try await aiService.commitDraftToMain(
+                    prompt: effectivePrompt,
+                    selectedFrame: selectedImageFrame,
+                    mainController: mainCanvas,
+                    draftController: draftCanvas
+                )
+                focusedBoard = .main
+                showAIHint("主画面已经更新。")
+            } catch {
+                showAIHint(error.localizedDescription)
+            }
+        }
+    }
+
+    private func testLiveSession() {
+        Task {
+            do {
+                let message = try await aiService.createLiveSession()
+                showAIHint(message)
+            } catch {
+                showAIHint(error.localizedDescription)
+            }
+        }
+    }
+
+    private func showAIHint(_ text: String) {
+        withAnimation(.easeOut(duration: 0.22)) {
+            aiHint = text
+        }
+
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2.4))
+            if aiHint == text {
+                withAnimation(.easeIn(duration: 0.22)) {
+                    aiHint = nil
+                }
+            }
+        }
+    }
+}
+
+private struct OnceExportDialog: View {
+    @Binding var name: String
+    let onCancel: () -> Void
+    let onSave: () -> Void
+
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.52)
+                .ignoresSafeArea()
+                .onTapGesture { }
+
+            VStack(alignment: .leading, spacing: 16) {
+                Text("保存项目")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(Color.black.opacity(0.90))
+
+                TextField("给这个项目取个名字", text: $name)
+                    .focused($focused)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(Color.black.opacity(0.88))
+                    .submitLabel(.done)
+                    .padding(.horizontal, 13)
+                    .frame(height: 42)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(Color.black.opacity(0.055))
+                    )
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(Color.black.opacity(0.09), lineWidth: 0.8)
+                    }
+                    .onSubmit {
+                        let cleaned = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !cleaned.isEmpty { onSave() }
+                    }
+
+                HStack {
+                    Spacer()
+
+                    Button("取消", action: onCancel)
+                        .buttonStyle(.plain)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Color.black.opacity(0.48))
+                        .padding(.horizontal, 12)
+                        .frame(height: 34)
+
+                    Button(action: onSave) {
+                        Text("保存")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(Color.white)
+                            .padding(.horizontal, 17)
+                            .frame(height: 34)
+                            .background(
+                                Capsule(style: .continuous)
+                                    .fill(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Color.black.opacity(0.28) : Color.black)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .padding(20)
+            .frame(width: 340)
+            .background(
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(Color.white)
+            )
+            .shadow(color: Color.black.opacity(0.22), radius: 30, x: 0, y: 10)
+            .onAppear {
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(220))
+                    focused = true
+                }
+            }
+        }
+    }
+}
+
+private struct OnceVideoPlaceholderView: View {
+    let onBack: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+
+            VStack(spacing: 8) {
+                Text("视频帧")
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.90))
+                Text("这一部分先留空，等我们单独设计视频工作区。")
+                    .font(.system(size: 12, weight: .regular))
+                    .foregroundStyle(Color.white.opacity(0.34))
+            }
+
+            VStack {
+                HStack {
+                    Button(action: onBack) {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(Color.white.opacity(0.84))
+                            .frame(width: 36, height: 32)
+                            .background(
+                                Capsule(style: .continuous)
+                                    .fill(Color.white.opacity(0.07))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("返回主页")
+
+                    Spacer()
+                }
+                Spacer()
+            }
+            .padding(18)
+        }
+        .preferredColorScheme(.dark)
+    }
+}
+
+private enum OnceBoardKind: Hashable {
+    case main
+    case draft
+
+    var title: String {
+        switch self {
+        case .main: return "主画面"
+        case .draft: return "草稿"
+        }
+    }
+}
+
+private enum OnceCanvasTool {
+    case pen
+    case eraser
+}
+
+private final class OnceDrawingController: ObservableObject {
+    @Published var tool: OnceCanvasTool = .pen
+    @Published var hasDrawing = false
+    @Published var aiImage: UIImage?
+    @Published var aiModelLabel: String?
+
+    var drawing = PKDrawing()
+    weak var canvasView: PKCanvasView?
+
+    func attach(_ canvasView: PKCanvasView) {
+        self.canvasView = canvasView
+        canvasView.drawing = drawing
+        applyTool()
+    }
+
+    func updateDrawing(_ drawing: PKDrawing) {
+        self.drawing = drawing
+        hasDrawing = !drawing.strokes.isEmpty
+    }
+
+    func setTool(_ newTool: OnceCanvasTool) {
+        tool = newTool
+        applyTool()
+    }
+
+    func setAIImage(_ image: UIImage?, modelLabel: String?) {
+        aiImage = image
+        aiModelLabel = modelLabel
+    }
+
+    func applyTool() {
+        guard let canvasView else { return }
+        switch tool {
+        case .pen:
+            canvasView.tool = PKInkingTool(.pen, color: .black, width: 3.2)
+        case .eraser:
+            canvasView.tool = PKEraserTool(.vector)
+        }
+    }
+
+    func undo() {
+        canvasView?.undoManager?.undo()
+    }
+
+    func redo() {
+        canvasView?.undoManager?.redo()
+    }
+
+    func compositedImage(targetSize: CGSize = CGSize(width: 1280, height: 720)) -> UIImage? {
+        let renderer = UIGraphicsImageRenderer(size: targetSize)
+        let image = renderer.image { context in
+            UIColor.white.setFill()
+            context.fill(CGRect(origin: .zero, size: targetSize))
+
+            if let aiImage {
+                let fittedRect = AVMakeRect(aspectRatio: aiImage.size, insideRect: CGRect(origin: .zero, size: targetSize))
+                aiImage.draw(in: fittedRect)
+            }
+
+            let drawingImage = drawing.image(from: CGRect(origin: .zero, size: targetSize), scale: 1.0)
+            drawingImage.draw(in: CGRect(origin: .zero, size: targetSize))
+        }
+        return image
+    }
+
+    func compositedImageBase64() -> String? {
+        guard let image = compositedImage(), let data = image.jpegData(compressionQuality: 0.92) else { return nil }
+        return data.base64EncodedString()
+    }
+}
+
+private struct OnceBoardPanel: View {
+    let kind: OnceBoardKind
+    @ObservedObject var controller: OnceDrawingController
+    let isFocused: Bool
+    let onInteract: () -> Void
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Color.white
+
+            if let image = controller.aiImage {
+                GeometryReader { proxy in
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: proxy.size.width, height: proxy.size.height)
+                        .clipped()
+                }
+                .allowsHitTesting(false)
+            }
+
+            OncePencilCanvas(controller: controller, onInteract: onInteract)
+                .background(Color.clear)
+
+            if !controller.hasDrawing && controller.aiImage == nil {
+                VStack(spacing: 5) {
+                    Text(kind == .main ? "开始画，或让 Once 把确认后的内容放到这里" : "AI 的整张草稿、局部方案和你的试画都可以留在这里")
+                        .font(.system(size: 11.5, weight: .regular))
+                        .foregroundStyle(Color.black.opacity(0.20))
+                    Text("双指缩放 / 移动")
+                        .font(.system(size: 9.5, weight: .medium))
+                        .foregroundStyle(Color.black.opacity(0.14))
+                }
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 26)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .allowsHitTesting(false)
+            }
+
+            HStack {
+                Text(kind.title)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.black.opacity(0.50))
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 6)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(Color.white.opacity(0.86))
+                    )
+
+                Spacer()
+
+                if let label = controller.aiModelLabel {
+                    Text(label)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(Color.black.opacity(0.52))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(Color.white.opacity(0.84))
+                        )
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.top, 9)
+            .allowsHitTesting(false)
+        }
+        .overlay {
+            Rectangle()
+                .stroke(Color.white.opacity(isFocused ? 0.46 : 0.12), lineWidth: isFocused ? 1.2 : 0.6)
+                .allowsHitTesting(false)
+        }
+        .clipped()
+    }
+}
+
+private struct OncePencilCanvas: UIViewRepresentable {
+    @ObservedObject var controller: OnceDrawingController
+    let onInteract: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    func makeUIView(context: Context) -> PKCanvasView {
+        let canvas = PKCanvasView(frame: .zero)
+        canvas.delegate = context.coordinator
+        canvas.backgroundColor = .clear
+        canvas.isOpaque = false
+        canvas.drawingPolicy = .anyInput
+        canvas.minimumZoomScale = 0.35
+        canvas.maximumZoomScale = 6.0
+        canvas.bouncesZoom = true
+        canvas.alwaysBounceVertical = true
+        canvas.alwaysBounceHorizontal = true
+        canvas.showsVerticalScrollIndicator = false
+        canvas.showsHorizontalScrollIndicator = false
+        canvas.contentSize = CGSize(width: 1800, height: 1200)
+        controller.attach(canvas)
+        return canvas
+    }
+
+    func updateUIView(_ uiView: PKCanvasView, context: Context) {
+        controller.applyTool()
+    }
+
+    final class Coordinator: NSObject, PKCanvasViewDelegate {
+        let parent: OncePencilCanvas
+
+        init(parent: OncePencilCanvas) {
+            self.parent = parent
+        }
+
+        func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
+            parent.onInteract()
+        }
+
+        func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
+            parent.controller.updateDrawing(canvasView.drawing)
+        }
+
+        func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+            parent.onInteract()
+        }
+
+        func scrollViewWillBeginZooming(_ scrollView: UIScrollView, with view: UIView?) {
+            parent.onInteract()
+        }
+    }
+}
+
+private struct OnceToolButton: View {
+    let systemName: String
+    var selected: Bool = false
+    let accessibility: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(Color.white.opacity(selected ? 0.96 : 0.66))
+                .frame(width: 28, height: 26)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.white.opacity(selected ? 0.14 : 0.001))
+                )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(accessibility)
+    }
+}
+
+private struct OnceImageFrameStrip: View {
+    @Binding var selectedFrame: Int
+    let frameCount: Int
+    let onAdd: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text("画面")
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundStyle(Color.white.opacity(0.40))
+                .padding(.leading, 4)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 7) {
+                    ForEach(0..<frameCount, id: \.self) { frame in
+                        Button {
+                            selectedFrame = frame
+                        } label: {
+                            ZStack(alignment: .bottomLeading) {
+                                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                    .fill(Color.white.opacity(selectedFrame == frame ? 0.18 : 0.075))
+
+                                Text(String(format: "%02d", frame + 1))
+                                    .font(.system(size: 8.5, weight: .semibold))
+                                    .foregroundStyle(Color.white.opacity(selectedFrame == frame ? 0.92 : 0.50))
+                                    .padding(6)
+                            }
+                            .frame(width: 76, height: 38)
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                    .stroke(Color.white.opacity(selectedFrame == frame ? 0.44 : 0.08), lineWidth: selectedFrame == frame ? 1.0 : 0.6)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    Button(action: onAdd) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(Color.white.opacity(0.58))
+                            .frame(width: 40, height: 38)
+                            .background(
+                                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                    .fill(Color.white.opacity(0.055))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.white.opacity(0.045))
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.white.opacity(0.065), lineWidth: 0.7)
+        }
+    }
+}
+
+private struct OnceAIConsoleCard: View {
+    @ObservedObject var aiService: OnceAIService
+    let onClose: () -> Void
+    let onOpenSettings: () -> Void
+    let onGenerateDraft: () -> Void
+    let onCommitToMain: () -> Void
+    let onTestLive: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 15) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Once AI")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(Color.white.opacity(0.92))
+                    Text("Live: GPT-Live-1  ·  Draft: Flare  ·  Render: Sunburst")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(Color.white.opacity(0.42))
+                }
+
+                Spacer()
+
+                Button("关闭", action: onClose)
+                    .buttonStyle(.plain)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.72))
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("当前状态")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.56))
+
+                Text("这里先不再放开发阶段的“指令”输入框了。现在这个面板只负责 AI 的连接和测试：草稿走 Flare，正式提交走 Sunburst，Live 会通过 Render 下发 session。")
+                    .font(.system(size: 12.5, weight: .regular))
+                    .foregroundStyle(Color.white.opacity(0.76))
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .fill(Color.white.opacity(0.06))
+                    )
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .stroke(Color.white.opacity(0.08), lineWidth: 0.8)
+                    }
+            }
+
+            HStack(spacing: 10) {
+                Button(action: onGenerateDraft) {
+                    Text("生成草稿")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Color.black)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 40)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(Color.white)
+                        )
+                }
+                .buttonStyle(.plain)
+                .disabled(aiService.isWorking)
+
+                Button(action: onCommitToMain) {
+                    Text("提交主画面")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Color.white.opacity(0.92))
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 40)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(Color.white.opacity(0.10))
+                        )
+                }
+                .buttonStyle(.plain)
+                .disabled(aiService.isWorking)
+            }
+
+            HStack(spacing: 10) {
+                Button(action: onTestLive) {
+                    Text(aiService.liveStatusTitle)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Color.white.opacity(0.88))
+                        .frame(height: 34)
+                        .padding(.horizontal, 14)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(Color.white.opacity(0.08))
+                        )
+                }
+                .buttonStyle(.plain)
+                .disabled(aiService.isWorking)
+
+                Button(action: onOpenSettings) {
+                    Text("连接设置")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Color.white.opacity(0.70))
+                        .frame(height: 34)
+                        .padding(.horizontal, 14)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(Color.white.opacity(0.05))
+                        )
+                }
+                .buttonStyle(.plain)
+
+                Spacer()
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(aiService.configurationSummary)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Color.white.opacity(0.34))
+                    .lineLimit(1)
+
+                HStack(spacing: 8) {
+                    if aiService.isWorking {
+                        ProgressView()
+                            .tint(.white)
+                            .scaleEffect(0.8)
+                    }
+                    Text(aiService.statusMessage)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(Color.white.opacity(0.66))
+                        .lineLimit(2)
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 430)
+        .background(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(Color.black.opacity(0.92))
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 0.8)
+        }
+        .shadow(color: Color.black.opacity(0.28), radius: 30, x: 0, y: 12)
+    }
+}
+
+private struct OnceAISettingsCard: View {
+    @State private var baseURL: String
+    @State private var authToken: String
+    let onClose: () -> Void
+    let onSave: (String, String) -> Void
+
+    init(initialBaseURL: String, initialAuthToken: String, onClose: @escaping () -> Void, onSave: @escaping (String, String) -> Void) {
+        _baseURL = State(initialValue: initialBaseURL)
+        _authToken = State(initialValue: initialAuthToken)
+        self.onClose = onClose
+        self.onSave = onSave
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 15) {
+            HStack {
+                Text("AI 连接设置")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.92))
+                Spacer()
+                Button("关闭", action: onClose)
+                    .buttonStyle(.plain)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.72))
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Render Base URL")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.56))
+                TextField("https://your-render-service.onrender.com", text: $baseURL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .font(.system(size: 13.5, weight: .regular))
+                    .foregroundStyle(Color.white.opacity(0.88))
+                    .padding(.horizontal, 12)
+                    .frame(height: 42)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(Color.white.opacity(0.06))
+                    )
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Bearer Token（可选）")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.56))
+                TextField("Render 鉴权 Token", text: $authToken)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .font(.system(size: 13.5, weight: .regular))
+                    .foregroundStyle(Color.white.opacity(0.88))
+                    .padding(.horizontal, 12)
+                    .frame(height: 42)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(Color.white.opacity(0.06))
+                    )
+            }
+
+            Text("Live 通过 Render 下发临时 session；草稿走 Flare；正式提交走 Sunburst。正式 OpenAI key 不要写进 Xcode。")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Color.white.opacity(0.34))
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack {
+                Spacer()
+                Button(action: { onSave(baseURL, authToken) }) {
+                    Text("保存")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Color.black)
+                        .padding(.horizontal, 18)
+                        .frame(height: 36)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(Color.white)
+                        )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(20)
+        .frame(width: 430)
+        .background(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(Color.black.opacity(0.94))
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 0.8)
+        }
+    }
+}
+
+private enum OnceAIServiceError: LocalizedError {
+    case missingBaseURL
+    case badURL
+    case invalidResponse
+    case backend(String)
+    case missingImage
+
+    var errorDescription: String? {
+        switch self {
+        case .missingBaseURL:
+            return "还没有配置 Render Base URL。先去连接设置里填一下。"
+        case .badURL:
+            return "Render Base URL 看起来不对。"
+        case .invalidResponse:
+            return "Render 返回的数据我暂时没读懂。"
+        case .backend(let message):
+            return message
+        case .missingImage:
+            return "后端已经响应了，但没有带回图片。"
+        }
+    }
+}
+
+@MainActor
+private final class OnceAIService: ObservableObject {
+    @Published var statusMessage: String = "还没开始。先配置 Render，再测试草稿生成。"
+    @Published var isWorking: Bool = false
+    @Published var lastModelName: String?
+    @Published var liveSessionSecretPreview: String?
+
+    private let baseURLKey = "once.ai.baseURL"
+    private let authTokenKey = "once.ai.authToken"
+
+    var baseURL: String { UserDefaults.standard.string(forKey: baseURLKey) ?? "" }
+    var authToken: String { UserDefaults.standard.string(forKey: authTokenKey) ?? "" }
+
+    var configurationSummary: String {
+        let cleaned = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? "Render：未配置" : "Render：\(cleaned)"
+    }
+
+    var liveStatusTitle: String {
+        liveSessionSecretPreview == nil ? "测试 Live 连接" : "刷新 Live Session"
+    }
+
+    func updateConfiguration(baseURL: String, authToken: String) {
+        UserDefaults.standard.set(baseURL.trimmingCharacters(in: .whitespacesAndNewlines), forKey: baseURLKey)
+        UserDefaults.standard.set(authToken.trimmingCharacters(in: .whitespacesAndNewlines), forKey: authTokenKey)
+        statusMessage = "AI 配置已保存。"
+    }
+
+    func generateDraft(prompt: String, selectedFrame: Int, mainController: OnceDrawingController, draftController: OnceDrawingController) async throws {
+        isWorking = true
+        statusMessage = "正在用 Flare 生成草稿…"
+        defer { isWorking = false }
+
+        let payload: [String: Any] = [
+            "prompt": prompt,
+            "frame_index": selectedFrame,
+            "style_profile": "once_2d_default_v1",
+            "style_prompt": onceStylePrompt,
+            "main_board_image_base64": mainController.compositedImageBase64() as Any,
+            "draft_board_image_base64": draftController.compositedImageBase64() as Any,
+            "target": "draft",
+            "model": "gpt-image-2.5-flare-2026-09-08"
+        ]
+
+        let result = try await sendJSON(endpoint: "/once/draft", body: payload)
+        let image = try await decodeImage(from: result)
+        let model = extractString(["model", "model_name"], from: result) ?? "Flare"
+        draftController.setAIImage(image, modelLabel: model)
+        lastModelName = model
+        statusMessage = extractString(["message", "detail"], from: result) ?? "草稿生成完成。"
+    }
+
+    func commitDraftToMain(prompt: String, selectedFrame: Int, mainController: OnceDrawingController, draftController: OnceDrawingController) async throws {
+        isWorking = true
+        statusMessage = "正在用 Sunburst 更新主画面…"
+        defer { isWorking = false }
+
+        let payload: [String: Any] = [
+            "prompt": prompt,
+            "frame_index": selectedFrame,
+            "style_profile": "once_2d_default_v1",
+            "style_prompt": onceStylePrompt,
+            "main_board_image_base64": mainController.compositedImageBase64() as Any,
+            "draft_board_image_base64": draftController.compositedImageBase64() as Any,
+            "approved_draft_image_base64": draftController.compositedImageBase64() as Any,
+            "target": "main",
+            "model": "gpt-image-2.5-sunburst-2026-09-08"
+        ]
+
+        let result = try await sendJSON(endpoint: "/once/render", body: payload)
+        let image = try await decodeImage(from: result)
+        let model = extractString(["model", "model_name"], from: result) ?? "Sunburst"
+        mainController.setAIImage(image, modelLabel: model)
+        lastModelName = model
+        statusMessage = extractString(["message", "detail"], from: result) ?? "主画面更新完成。"
+    }
+
+    func createLiveSession() async throws -> String {
+        isWorking = true
+        statusMessage = "正在向 Render 请求 GPT-Live-1 session…"
+        defer { isWorking = false }
+
+        let result = try await sendJSON(endpoint: "/once/live/session", body: [
+            "model": "gpt-live-1",
+            "voice": "alloy"
+        ])
+
+        let secret = extractString(["client_secret", "ephemeral_key", "session_secret"], from: result) ?? "session-created"
+        liveSessionSecretPreview = String(secret.prefix(16))
+        let message = extractString(["message", "detail"], from: result) ?? "Live session 已创建。下一步可以把它接到 WebRTC。"
+        statusMessage = message
+        return message
+    }
+
+    private var onceStylePrompt: String {
+        """
+        Once default 2D style. Hand-drawn 2D action animation look. Bold expressive line art, flat cel coloring, controlled shadows, simplified backgrounds, strong silhouettes, dynamic perspective, exaggerated action poses, speed-line friendly action composition, no photorealism, no 3D CGI look, no glossy game-render finish.
+        """
+    }
+
+    private func sendJSON(endpoint: String, body: [String: Any]) async throws -> [String: Any] {
+        let cleanedBaseURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanedBaseURL.isEmpty else { throw OnceAIServiceError.missingBaseURL }
+        guard let url = URL(string: cleanedBaseURL + endpoint) else { throw OnceAIServiceError.badURL }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let token = authToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !token.isEmpty {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        request.timeoutInterval = 120
+        request.httpBody = try JSONSerialization.data(withJSONObject: sanitizeJSONObject(body), options: [])
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw OnceAIServiceError.invalidResponse }
+
+        let raw = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        if !(200...299).contains(http.statusCode) {
+            let message = raw.flatMap { extractString(["error", "message", "detail"], from: $0) } ?? "Render 请求失败（\(http.statusCode)）"
+            throw OnceAIServiceError.backend(message)
+        }
+        guard let raw else { throw OnceAIServiceError.invalidResponse }
+        return raw
+    }
+
+    private func decodeImage(from json: [String: Any]) async throws -> UIImage {
+        if let base64 = extractString(["image_base64", "imageBase64", "b64_json"], from: json) {
+            if let data = Data(base64Encoded: base64), let image = UIImage(data: data) {
+                return image
+            }
+        }
+        if let urlString = extractString(["image_url", "imageURL", "url"], from: json), let url = URL(string: urlString) {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            if let image = UIImage(data: data) {
+                return image
+            }
+        }
+        throw OnceAIServiceError.missingImage
+    }
+
+    private func extractString(_ keys: [String], from json: [String: Any]) -> String? {
+        for key in keys {
+            if let string = json[key] as? String, !string.isEmpty {
+                return string
+            }
+        }
+        return nil
+    }
+
+    private func sanitizeJSONObject(_ object: Any) -> Any {
+        let mirror = Mirror(reflecting: object)
+        if mirror.displayStyle == .optional {
+            if let child = mirror.children.first {
+                return sanitizeJSONObject(child.value)
+            } else {
+                return NSNull()
+            }
+        }
+        if let dict = object as? [String: Any] {
+            var output: [String: Any] = [:]
+            for (key, value) in dict {
+                let sanitized = sanitizeJSONObject(value)
+                if sanitized is NSNull { continue }
+                output[key] = sanitized
+            }
+            return output
+        }
+        if let array = object as? [Any] {
+            return array.compactMap {
+                let sanitized = sanitizeJSONObject($0)
+                return sanitized is NSNull ? nil : sanitized
+            }
+        }
+        return object
+    }
+}
+
+private struct NamePromptCard: View {
+    @Binding var nickname: String
+    var isFocused: FocusState<Bool>.Binding
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text("你好，以后我就叫你")
+                .font(.system(size: 18, weight: .regular))
+                .foregroundStyle(.black.opacity(0.88))
+                .fixedSize()
+
+            TextField("名字", text: $nickname)
+                .focused(isFocused)
+                .font(.system(size: 18, weight: .medium))
+                .foregroundStyle(.black.opacity(0.94))
+                .multilineTextAlignment(.center)
+                .submitLabel(.done)
+                .frame(minWidth: 76, idealWidth: 104, maxWidth: 132)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .fill(Color.black.opacity(0.055))
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .stroke(Color.black.opacity(0.10), lineWidth: 0.8)
+                }
+                .onSubmit {
+                    isFocused.wrappedValue = false
+                }
+
+            Text("。")
+                .font(.system(size: 18, weight: .regular))
+                .foregroundStyle(.black.opacity(0.88))
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 15)
+        .background(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(Color.white.opacity(0.96))
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(Color.black.opacity(0.08), lineWidth: 0.8)
+        }
+        .shadow(color: Color.black.opacity(0.055), radius: 20, x: 0, y: 7)
+    }
+}
+
+private struct GlyphRevealText: View {
+    let text: String
+    let visibleIndexes: Set<Int>
+
+    private var characters: [Character] {
+        Array(text)
+    }
+
+    var body: some View {
+        CenteredGlyphFlow(spacing: 0, lineSpacing: 7) {
+            ForEach(characters.indices, id: \.self) { index in
+                let isVisible = visibleIndexes.contains(index)
+
+                Text(String(characters[index]))
+                    .font(.system(size: 20, weight: .regular, design: .default))
+                    .tracking(0.1)
+                    .foregroundStyle(.black.opacity(0.92))
+                    .opacity(isVisible ? 1 : 0)
+                    .blur(radius: isVisible ? 0 : 8)
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(text))
+    }
+}
+
+/// A tiny layout used only for the intro paragraph. Each glyph remains an
+/// independent SwiftUI view so blur/opacity can animate per character while
+/// the lines still wrap naturally and stay centered.
+private struct CenteredGlyphFlow: Layout {
+    var spacing: CGFloat = 0
+    var lineSpacing: CGFloat = 7
+
+    struct Line {
+        var indices: [Int] = []
+        var width: CGFloat = 0
+        var height: CGFloat = 0
+    }
+
+    func sizeThatFits(
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) -> CGSize {
+        let maxWidth = proposal.width ?? .greatestFiniteMagnitude
+        let lines = makeLines(subviews: subviews, maxWidth: maxWidth)
+        let height = lines.enumerated().reduce(CGFloat.zero) { partial, pair in
+            partial + pair.element.height + (pair.offset == lines.count - 1 ? 0 : lineSpacing)
+        }
+        let width = min(maxWidth, lines.map(\.width).max() ?? 0)
+        return CGSize(width: width, height: height)
+    }
+
+    func placeSubviews(
+        in bounds: CGRect,
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) {
+        let lines = makeLines(subviews: subviews, maxWidth: bounds.width)
+        var y = bounds.minY
+
+        for line in lines {
+            var x = bounds.minX + max(0, (bounds.width - line.width) / 2)
+
+            for index in line.indices {
+                let size = subviews[index].sizeThatFits(.unspecified)
+                let glyphY = y + (line.height - size.height) / 2
+                subviews[index].place(
+                    at: CGPoint(x: x, y: glyphY),
+                    anchor: .topLeading,
+                    proposal: ProposedViewSize(width: size.width, height: size.height)
+                )
+                x += size.width + spacing
+            }
+
+            y += line.height + lineSpacing
+        }
+    }
+
+    private func makeLines(subviews: Subviews, maxWidth: CGFloat) -> [Line] {
+        guard !subviews.isEmpty else { return [] }
+
+        var lines: [Line] = []
+        var current = Line()
+
+        for index in subviews.indices {
+            let size = subviews[index].sizeThatFits(.unspecified)
+            let addedSpacing = current.indices.isEmpty ? 0 : spacing
+            let proposedWidth = current.width + addedSpacing + size.width
+
+            if proposedWidth > maxWidth, !current.indices.isEmpty {
+                lines.append(current)
+                current = Line()
+            }
+
+            let spacingForCurrent = current.indices.isEmpty ? 0 : spacing
+            current.indices.append(index)
+            current.width += spacingForCurrent + size.width
+            current.height = max(current.height, size.height)
+        }
+
+        if !current.indices.isEmpty {
+            lines.append(current)
+        }
+
+        return lines
+    }
+}
+
+#Preview {
+    OnceRootView()
+}
