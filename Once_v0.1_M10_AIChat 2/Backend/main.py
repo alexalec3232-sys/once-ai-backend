@@ -386,7 +386,7 @@ def root():
         "service": "once-ai-backend",
         "story_context": "v1.5-companion-router",
         "router": "heuristic-v2-sticky",
-        "project_layer": "m13-shot-screenplay",
+        "project_layer": "m13.1-shot-screenplay-edit-sync",
     }
 
 
@@ -407,7 +407,7 @@ def health():
         "live_model": LIVE_MODEL,
         "draft_image_model": DRAFT_IMAGE_MODEL,
         "render_image_model": RENDER_IMAGE_MODEL,
-        "project_prepare": "v2-shot-screenplay",
+        "project_prepare": "v2.1-shot-screenplay-edit-sync",
     }
 
 
@@ -615,6 +615,72 @@ def prepare_project(body: ProjectPrepareRequest):
         "project_brief": brief.model_dump(),
         "screenplay": screenplay.model_dump(),
         "story_revision": (body.story_state.revision if body.story_state else 0),
+    }
+
+
+class ProjectScreenplaySyncRequest(BaseModel):
+    previous_screenplay: ScreenplaySummary
+    edited_screenplay: ScreenplaySummary
+    project_brief: ProjectBrief | None = None
+    story_state: StoryState | None = None
+
+
+@app.post("/once/project/sync-screenplay")
+def sync_edited_screenplay(body: ProjectScreenplaySyncRequest):
+    if not os.environ.get("OPENAI_API_KEY"):
+        raise HTTPException(status_code=500, detail="Render 缺少 OPENAI_API_KEY")
+    if not body.edited_screenplay.shots:
+        raise HTTPException(status_code=400, detail="编辑后的镜头剧本为空")
+
+    # The user's edited screenplay is authoritative. This pass is intentionally cheap:
+    # it does not rewrite the visible screenplay, it only reads what changed and refreshes
+    # the hidden brief consumed by realtime voice and image models.
+    sync_prompt = (
+        "You are Once's PROJECT CONTEXT SYNCHRONIZER. "
+        "The user manually edited a shot screenplay. Compare BEFORE and AFTER carefully. "
+        "Treat AFTER as authoritative user intent. Do not rewrite, improve, critique, or add shots. "
+        "Do not silently invent canon. Your only job is to understand the exact changes and update the hidden project brief so downstream voice and image models follow the edited screenplay. "
+        "Preserve established story facts unless the user's manual edits clearly override the presentation of a shot. "
+        "Return valid JSON only with exactly this shape: "
+        "{project_brief:{project_summary:string,creative_intent:string,current_story_position:string,visual_direction:[string],characters:[string],scene_goals:[string],continuity_constraints:[string],emotional_targets:[string],open_decisions:[string],voice_context:string,image_context:string},change_summary:[string]}. "
+        "change_summary should be short factual notes about what the user changed, with no advice."
+    )
+
+    payload = {
+        "before": body.previous_screenplay.model_dump(),
+        "after": body.edited_screenplay.model_dump(),
+        "existing_project_brief": body.project_brief.model_dump() if body.project_brief else {},
+        "story_state": body.story_state.model_dump() if body.story_state else {},
+    }
+
+    try:
+        response = client.responses.create(
+            model=CONTEXT_MODEL,
+            reasoning={"effort": "none"},
+            instructions=sync_prompt,
+            input=[{
+                "role": "user",
+                "content": "Return valid JSON only. Read the user's screenplay edits and synchronize the hidden project context.\n" + json.dumps(payload, ensure_ascii=False),
+            }],
+            store=False,
+            max_output_tokens=2200,
+        )
+        decoded = json.loads(_clean_json_text(response.output_text or ""))
+        brief = ProjectBrief.model_validate(decoded.get("project_brief", {}))
+        change_summary = decoded.get("change_summary") or []
+        if not isinstance(change_summary, list):
+            change_summary = []
+        change_summary = [trim_text(str(item), 300) for item in change_summary[:20] if str(item).strip()]
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="AI 同步剧本修改失败：" + str(exc)) from exc
+
+    # Return the user's screenplay unchanged; the backend never gets to 'correct' manual edits.
+    return {
+        "ok": True,
+        "model": CONTEXT_MODEL,
+        "screenplay": body.edited_screenplay.model_dump(),
+        "project_brief": brief.model_dump(),
+        "change_summary": change_summary,
     }
 
 
