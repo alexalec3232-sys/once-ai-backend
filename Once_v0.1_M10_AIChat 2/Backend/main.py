@@ -1,13 +1,17 @@
+import asyncio
+import base64
 import json
 import os
 import re
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
 from openai import OpenAI
+import httpx
+import websockets
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Once AI Backend", version="0.2.5")
+app = FastAPI(title="Once AI Backend", version="0.3.0")
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # Cost-aware model split.
@@ -17,6 +21,19 @@ CONTEXT_MODEL = os.environ.get("ONCE_CONTEXT_MODEL", LUNA_MODEL)
 
 # Keep real conversation short; persistent StoryState carries the long-range story.
 RECENT_MESSAGE_COUNT = int(os.environ.get("ONCE_RECENT_MESSAGE_COUNT", "8"))
+
+# Project/voice/image models. These can be overridden in Render without touching the app.
+LIVE_MODEL = os.environ.get("ONCE_LIVE_MODEL", "gpt-live-1")
+DRAFT_IMAGE_MODEL = os.environ.get("ONCE_DRAFT_IMAGE_MODEL", "gpt-image-2.5-flare")
+RENDER_IMAGE_MODEL = os.environ.get("ONCE_RENDER_IMAGE_MODEL", "gpt-image-2.5-sunburst")
+
+# Original 2D action-animation baseline for Once. Keep this descriptive rather than copying any named frame.
+ONCE_VISUAL_BASELINE = (
+    "Original stylized 2D action-animation aesthetic: clean bold linework, flat cel shading, "
+    "expressive silhouettes, dynamic motion, readable staging, cinematic composition, restrained texture, "
+    "and simplified backgrounds when speed or action is the focus. Preserve character identity and continuity. "
+    "Do not copy existing copyrighted characters, logos, subtitles, or exact frames."
+)
 
 
 class ChatMessage(BaseModel):
@@ -369,6 +386,7 @@ def root():
         "service": "once-ai-backend",
         "story_context": "v1.5-companion-router",
         "router": "heuristic-v2-sticky",
+        "project_layer": "m12-model-plumbing",
     }
 
 
@@ -386,6 +404,10 @@ def health():
         "context_model": CONTEXT_MODEL,
         "story_context": "v1.5-companion-router",
         "recent_messages": RECENT_MESSAGE_COUNT,
+        "live_model": LIVE_MODEL,
+        "draft_image_model": DRAFT_IMAGE_MODEL,
+        "render_image_model": RENDER_IMAGE_MODEL,
+        "project_prepare": "v1",
     }
 
 
@@ -465,3 +487,398 @@ def once_chat(body: ChatRequest):
             "memory": memory_usage,
         },
     }
+
+# ---------- Project preparation ----------
+
+class ProjectPrepareRequest(BaseModel):
+    nickname: str = ""
+    messages: list[ChatMessage] = Field(default_factory=list, max_length=120)
+    story_state: StoryState | None = None
+
+
+class ProjectBrief(BaseModel):
+    project_summary: str = ""
+    creative_intent: str = ""
+    current_story_position: str = ""
+    visual_direction: list[str] = Field(default_factory=list)
+    characters: list[str] = Field(default_factory=list)
+    scene_goals: list[str] = Field(default_factory=list)
+    continuity_constraints: list[str] = Field(default_factory=list)
+    emotional_targets: list[str] = Field(default_factory=list)
+    open_decisions: list[str] = Field(default_factory=list)
+    voice_context: str = ""
+    image_context: str = ""
+
+
+def _clean_json_text(raw: str) -> str:
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE | re.DOTALL).strip()
+    return raw
+
+
+def _project_history_for_prompt(messages: list[ChatMessage]) -> str:
+    # This is a one-off user-triggered compilation, so it can read more history than ordinary chat,
+    # but still caps payload size because StoryState carries long-range facts.
+    pieces: list[str] = []
+    total = 0
+    for message in messages[-36:]:
+        part = f"{message.role.upper()}: {trim_text(message.content, 9000)}"
+        if total + len(part) > 70000:
+            break
+        pieces.append(part)
+        total += len(part)
+    return "\n\n".join(pieces)
+
+
+@app.post("/once/project/prepare")
+def prepare_project(body: ProjectPrepareRequest):
+    if not os.environ.get("OPENAI_API_KEY"):
+        raise HTTPException(status_code=500, detail="Render 缺少 OPENAI_API_KEY")
+    if not body.messages:
+        raise HTTPException(status_code=400, detail="还没有可整理的故事内容")
+
+    prompt = (
+        "You are preparing a production brief for Once, an AI-assisted 2D animation workspace. "
+        "Read the user's established story and current intent deeply, but do not invent canon. "
+        "Your job is to make the downstream voice model and image models understand what the user is trying to create before project mode starts. "
+        "Return exactly one valid JSON object matching this shape: "
+        "{project_summary:string, creative_intent:string, current_story_position:string, "
+        "visual_direction:[string], characters:[string], scene_goals:[string], continuity_constraints:[string], "
+        "emotional_targets:[string], open_decisions:[string], voice_context:string, image_context:string}. "
+        "The image_context should describe visual continuity, camera/composition tendencies, character consistency requirements, and the fixed original stylized 2D action-animation baseline. "
+        "The voice_context should tell a realtime creative partner what is already established, what the user is currently trying to make, and what must not be silently changed. "
+        "Do not add a new plot twist merely because it seems interesting."
+    )
+    evidence = (
+        "PERSISTENT STORY STATE:\n" + compact_story_state(body.story_state) +
+        "\n\nRECENT PROJECT CONVERSATION:\n" + _project_history_for_prompt(body.messages)
+    )
+
+    try:
+        response = client.responses.create(
+            model=SOL_MODEL,
+            reasoning={"effort": "low"},
+            instructions=prompt,
+            input=[{"role": "user", "content": "Return valid JSON only.\n" + evidence}],
+            store=False,
+            max_output_tokens=2600,
+        )
+        raw = _clean_json_text(response.output_text or "")
+        decoded = json.loads(raw)
+        brief = ProjectBrief.model_validate(decoded)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="剧本整理失败：" + str(exc)) from exc
+
+    return {
+        "ok": True,
+        "model": SOL_MODEL,
+        "project_brief": brief.model_dump(),
+        "story_revision": (body.story_state.revision if body.story_state else 0),
+    }
+
+
+# ---------- GPT Image 2.5 ----------
+
+class ImageRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=32000)
+    project_brief: dict | None = None
+    reference_image_base64: str | None = None
+    mask_image_base64: str | None = None
+    size: str = "1536x1024"
+    quality: Literal["low", "medium", "high", "xhigh", "max", "auto"] = "auto"
+    output_format: Literal["png", "jpeg", "webp"] = "png"
+
+
+def _validated_image_size(size: str) -> str:
+    if size == "auto":
+        return size
+    match = re.fullmatch(r"(\d+)x(\d+)", size)
+    if not match:
+        raise HTTPException(status_code=400, detail="图片尺寸格式不正确")
+    width, height = int(match.group(1)), int(match.group(2))
+    if width % 16 or height % 16 or width > 3840 or height > 3840:
+        raise HTTPException(status_code=400, detail="图片宽高需要是16的倍数且不超过3840")
+    ratio = max(width / height, height / width)
+    pixels = width * height
+    if ratio > 3 or pixels < 655360 or pixels > 8294400:
+        raise HTTPException(status_code=400, detail="图片比例或总像素超出模型范围")
+    return size
+
+
+def _decode_image(value: str | None, label: str) -> bytes | None:
+    if not value:
+        return None
+    try:
+        raw = value.split(",", 1)[1] if value.startswith("data:") and "," in value else value
+        return base64.b64decode(raw, validate=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"{label}不是有效的Base64图片") from exc
+
+
+def _image_prompt(body: ImageRequest, stage: str) -> str:
+    brief = ""
+    if body.project_brief:
+        brief = trim_text(json.dumps(body.project_brief, ensure_ascii=False), 14000)
+    if stage == "draft":
+        stage_instruction = (
+            "This is the DRAFT ENGINE. Prioritize camera, composition, pose, silhouette, action readability, facial intent, and spatial relationships. "
+            "It may look unfinished. Do not waste detail on polishing. Give the user something structurally useful to discuss and revise."
+        )
+    else:
+        stage_instruction = (
+            "This is the RENDER ENGINE. Preserve any established camera, composition, pose, character identity, scene layout, and locked story intent. "
+            "Improve linework, cel shading, lighting, materials, facial precision, and finish without silently redesigning the scene."
+        )
+    return (
+        ONCE_VISUAL_BASELINE + "\n\n" + stage_instruction +
+        ("\n\nPROJECT BRIEF:\n" + brief if brief else "") +
+        "\n\nUSER IMAGE REQUEST:\n" + body.prompt
+    )
+
+
+def _openai_image_request(model: str, body: ImageRequest, stage: str) -> dict:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="Render 缺少 OPENAI_API_KEY")
+    size = _validated_image_size(body.size)
+    prompt = _image_prompt(body, stage)
+    reference = _decode_image(body.reference_image_base64, "参考图")
+    mask = _decode_image(body.mask_image_base64, "蒙版")
+    headers = {"Authorization": "Bearer " + api_key}
+
+    try:
+        with httpx.Client(timeout=180.0) as http:
+            if reference is None:
+                response = http.post(
+                    "https://api.openai.com/v1/images/generations",
+                    headers={**headers, "Content-Type": "application/json"},
+                    json={
+                        "model": model,
+                        "prompt": prompt,
+                        "size": size,
+                        "quality": body.quality,
+                        "output_format": body.output_format,
+                        "background": "auto",
+                        "n": 1,
+                    },
+                )
+            else:
+                files: list[tuple[str, tuple[str, bytes, str]]] = [
+                    ("image", ("reference.png", reference, "image/png")),
+                ]
+                if mask is not None:
+                    files.append(("mask", ("mask.png", mask, "image/png")))
+                response = http.post(
+                    "https://api.openai.com/v1/images/edits",
+                    headers=headers,
+                    data={
+                        "model": model,
+                        "prompt": prompt,
+                        "size": size,
+                        "quality": body.quality,
+                        "output_format": body.output_format,
+                        "background": "auto",
+                    },
+                    files=files,
+                )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="图像模型连接失败：" + str(exc)) from exc
+
+    if response.status_code < 200 or response.status_code >= 300:
+        try:
+            message = response.json().get("error", {}).get("message", response.text)
+        except Exception:
+            message = response.text
+        raise HTTPException(status_code=502, detail=f"图像模型请求失败：{message}")
+
+    payload = response.json()
+    data = payload.get("data") or []
+    if not data or not data[0].get("b64_json"):
+        raise HTTPException(status_code=502, detail="图像模型没有返回图片")
+    item = data[0]
+    return {
+        "ok": True,
+        "model": model,
+        "stage": stage,
+        "image_base64": item["b64_json"],
+        "revised_prompt": item.get("revised_prompt"),
+        "output_format": body.output_format,
+        "size": size,
+    }
+
+
+@app.post("/once/image/draft")
+def image_draft(body: ImageRequest):
+    # Flare is intentionally used for fast structural drafts.
+    if body.quality == "auto":
+        body.quality = "low"
+    return _openai_image_request(DRAFT_IMAGE_MODEL, body, "draft")
+
+
+@app.post("/once/image/render")
+def image_render(body: ImageRequest):
+    # Sunburst is reserved for precise editing / final-quality passes.
+    if body.quality == "auto":
+        body.quality = "high"
+    return _openai_image_request(RENDER_IMAGE_MODEL, body, "render")
+
+
+# ---------- GPT-Live 1 relay ----------
+
+LIVE_PROMPT = (
+    "You are Once in realtime voice mode, a calm and sharp creative partner working beside the user on an original 2D animation project. "
+    "Speak naturally and briefly. Listen before taking over. Have opinions when they help, but never silently change established story canon. "
+    "When the user is actively drawing or revising a shot, talk about the current creative problem rather than lecturing about theory. "
+    "Backchannel policy: short natural acknowledgements are allowed when useful; do not fill every silence. "
+    "Interruption policy: stop cleanly when the user interrupts and follow their newest correction. "
+    "Delegation policy: use the Responses backend for reasoning-heavy story questions. The visual renderer is controlled by the Once application, not by pretending an image was created."
+)
+
+
+def _live_initial_input(project_context: str, history: list[dict]) -> list[dict]:
+    items: list[dict] = []
+    if project_context.strip():
+        items.append({
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "CURRENT PROJECT CONTEXT:\n" + trim_text(project_context, 16000)}],
+        })
+    for item in history[-8:]:
+        role = item.get("role")
+        content = trim_text(str(item.get("content", "")), 2500)
+        if role not in ("user", "assistant") or not content:
+            continue
+        content_type = "input_text" if role == "user" else "output_text"
+        items.append({"type": "message", "role": role, "content": [{"type": content_type, "text": content}]})
+    return items
+
+
+@app.websocket("/once/live")
+async def once_live(client_socket: WebSocket):
+    await client_socket.accept()
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        await client_socket.send_json({"type": "error", "message": "Render 缺少 OPENAI_API_KEY"})
+        await client_socket.close(code=1011)
+        return
+
+    try:
+        first = await client_socket.receive_text()
+        start = json.loads(first)
+        if start.get("type") != "start":
+            raise ValueError("第一条消息必须是 start")
+        project_context = str(start.get("project_context", ""))
+        history = start.get("history") if isinstance(start.get("history"), list) else []
+    except Exception as exc:
+        await client_socket.send_json({"type": "error", "message": "语音启动参数错误：" + str(exc)})
+        await client_socket.close(code=1003)
+        return
+
+    try:
+        async with websockets.connect(
+            "wss://api.openai.com/v1/live/sessions",
+            additional_headers={"Authorization": "Bearer " + api_key},
+            max_size=None,
+            ping_interval=20,
+            ping_timeout=20,
+        ) as upstream:
+            session_start = {
+                "type": "session.start",
+                "event_id": "once_live_start",
+                "session": {
+                    "model": LIVE_MODEL,
+                    "instructions": LIVE_PROMPT,
+                    "input": _live_initial_input(project_context, history),
+                    "audio": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "output": {"voice": "marin"},
+                    },
+                    "delegation": {
+                        "type": "responses",
+                        "responses": {
+                            "model": LUNA_MODEL,
+                            "instructions": SYSTEM_PROMPT,
+                        },
+                    },
+                    "store": False,
+                },
+            }
+            await upstream.send(json.dumps(session_start, ensure_ascii=False))
+
+            # Do not start phone capture until OpenAI confirms the session is ready.
+            while True:
+                raw = await upstream.recv()
+                event = json.loads(raw)
+                event_type = event.get("type", "")
+                if event_type == "session.started":
+                    await client_socket.send_json({
+                        "type": "ready",
+                        "session_id": (event.get("session") or {}).get("id"),
+                        "model": LIVE_MODEL,
+                    })
+                    break
+                if event_type == "error":
+                    await client_socket.send_json({"type": "error", "message": str(event.get("error") or event)})
+
+            async def client_to_openai():
+                try:
+                    while True:
+                        message = await client_socket.receive_text()
+                        item = json.loads(message)
+                        kind = item.get("type")
+                        if kind == "audio" and item.get("data"):
+                            await upstream.send(json.dumps({
+                                "type": "session.input_audio.append",
+                                "audio": item["data"],
+                            }))
+                        elif kind == "mute":
+                            await upstream.send(json.dumps({"type": "session.input_audio.mute"}))
+                        elif kind == "unmute":
+                            await upstream.send(json.dumps({"type": "session.input_audio.unmute"}))
+                        elif kind == "context" and item.get("content"):
+                            await upstream.send(json.dumps({
+                                "type": "session.instructions.append",
+                                "content": trim_text(str(item["content"]), 12000),
+                                "delegation_id": None,
+                            }, ensure_ascii=False))
+                        elif kind == "close":
+                            await upstream.send(json.dumps({"type": "session.close"}))
+                            return
+                except (WebSocketDisconnect, asyncio.CancelledError):
+                    return
+
+            async def openai_to_client():
+                try:
+                    async for raw in upstream:
+                        event = json.loads(raw)
+                        kind = event.get("type", "")
+                        if kind == "session.output_audio.delta":
+                            await client_socket.send_json({"type": "audio", "data": event.get("delta", "")})
+                        elif kind == "session.input_transcript.delta":
+                            await client_socket.send_json({"type": "user_transcript", "delta": event.get("delta", "")})
+                        elif kind == "session.output_transcript.delta":
+                            await client_socket.send_json({"type": "assistant_transcript", "delta": event.get("delta", "")})
+                        elif kind == "session.closed":
+                            await client_socket.send_json({"type": "closed", "usage": event.get("usage")})
+                            return
+                        elif kind == "error":
+                            await client_socket.send_json({"type": "error", "message": str(event.get("error") or event)})
+                except (asyncio.CancelledError, websockets.ConnectionClosed):
+                    return
+
+            sender = asyncio.create_task(client_to_openai())
+            receiver = asyncio.create_task(openai_to_client())
+            done, pending = await asyncio.wait({sender, receiver}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+    except Exception as exc:
+        try:
+            await client_socket.send_json({"type": "error", "message": "GPT-Live 连接失败：" + str(exc)})
+        except Exception:
+            pass
+        try:
+            await client_socket.close(code=1011)
+        except Exception:
+            pass
