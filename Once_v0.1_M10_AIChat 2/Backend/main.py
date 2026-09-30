@@ -763,7 +763,7 @@ def _image_prompt(body: ImageRequest, stage: str) -> str:
 
     if stage == "draft":
         stage_instruction = (
-            "This is Once's INCREMENTAL DRAFT ENGINE. Never try to complete the whole image in one pass. "
+            "This is Once's INCREMENTAL DRAFT ENGINE. Its output is not a finished picture: the iPhone app will trace this result into editable PencilKit strokes. Therefore use clean sparse line art with a plain empty background and avoid filled color areas. Never try to complete the whole image in one pass. "
             "Only perform the current requested pass and leave everything else intentionally unresolved. "
             "If a reference image exists, treat it as the user's current working state: preserve all unmentioned parts and change only what the user asked to change. "
             + pass_instruction
@@ -881,7 +881,8 @@ LIVE_PROMPT = (
     "Before the FIRST visual action in a shot, or before advancing to a new pass, briefly say exactly what you plan to add and ask for the user's confirmation. Do not call a visual tool in that same turn unless the user already explicitly approved that exact step (for example: '就这样画', '开始', '按这个来'). "
     "Within an already approved pass, direct corrections such as '男主再往右一点' or 'A再靠后' may be executed immediately without repeatedly asking. "
     "For instant structural marks such as a circle, line, arrow, box, rough person position, or simple staging layout, use the fast canvas blocking action instead of an image model. "
-    "For image-model work, first passes must stay rough and incomplete. Never add a detailed background, full costume, polished lighting, or complete render unless the user explicitly asks for that stage. "
+    "For DIRECT EDITS of the existing canvas—delete/erase, move, resize, rotate, change opacity, switch horizontal/vertical ratio, make a region darker/brighter, or clear a layer—use once_edit_canvas immediately. These are canvas operations, not image-generation requests. If the user explicitly says '删掉这个/往左一点/改横屏/这里暗一点', do the edit instead of telling them to do it manually. "
+    "For image-model work, every draft pass is converted by the app into editable PencilKit strokes. Draft outputs must therefore be line-first, sparse, rough and incomplete: no full-color finished frame, no polished lighting, no photorealistic or rendered background. Never add a detailed background, full costume, polished lighting, or complete render unless the user explicitly asks for that stage. "
     "Never use the final render action for a blank shot. Only use it after a visual has already been built progressively and the user explicitly asks to finish/refine/render it. "
     "MANDATORY visual direction whenever an image model is used: original hand-drawn 2D action-animation look, bold black contours, slightly rough expressive lines, flat simplified cel shading, high-contrast graphic shapes, dynamic action posing and motion accents; no photorealism, no 3D/CG, no glossy cinematic concept-art look. "
     "When the user is actively drawing or revising a shot, talk about the current creative problem rather than lecturing about theory. "
@@ -896,6 +897,7 @@ LIVE_BACKEND_PROMPT = (
       "The user is the director; never seize authorship of composition or staging. The operating mode is progressive co-creation, not one-shot generation. "
       "The valid visual progression is blocking -> pose -> shape -> environment -> style_draft -> finish, but the user may pause, revise, or skip a stage explicitly. "
       "For circles, lines, arrows, boxes, rough character positions, or first-pass staging, prefer once_canvas_blocking because it is immediate and editable. "
+      "For edits to existing canvas state, prefer once_edit_canvas over any image model. The draft layer is editable PencilKit stroke data, not a photo: you can erase/move/scale a region of those strokes. The final render, if one exists, is a separate raster layer that can also be moved/scaled/rotated/erased. You can change canvas ratio/orientation, global adjustments, and local brightness. Never answer '你自己删/你自己改' when a supported canvas edit exists. "
       "Use once_generate_draft only for the single requested visual pass. Always set pass_type to the narrowest stage that matches the user's current approved request. "
       "Use once_render_image only for finish/refinement AFTER a prior visual exists AND the user's latest message explicitly asks to finish, polish, refine, or render. Never render a blank shot. "
       "Do not bundle multiple stages into one call. If the user asks only for three rough positions with no background, the tool prompt must explicitly say no background and no added detail. "
@@ -939,8 +941,39 @@ LIVE_VISUAL_TOOLS = [
     },
     {
         "type": "function",
+        "name": "once_edit_canvas",
+        "description": "Directly edit the current editable canvas state without generating a new image. Drafts are editable PencilKit strokes: erase/move/scale them by region. Final raster layers can also be erased/moved/scaled/rotated. Use this for explicit user corrections immediately.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "erase_ai_region", "clear_ai_image", "clear_editable_sketch", "erase_sketch_region", "move_sketch_region", "scale_sketch_region", "clear_blocking", "clear_user_drawing", "clear_all_visuals",
+                        "move_ai_image", "scale_ai_image", "rotate_ai_image", "set_ai_opacity", "set_aspect_ratio",
+                        "set_brightness", "set_contrast", "set_saturation", "set_exposure", "local_brightness",
+                        "clear_local_adjustments", "set_background_black", "set_background_transparent"
+                    ]
+                },
+                "shot_number": {"type": "integer", "description": "Optional 1-based screenplay shot number."},
+                "x": {"type": "number", "description": "Normalized center X (0..1) for move or region operations."},
+                "y": {"type": "number", "description": "Normalized center Y (0..1) for move or region operations."},
+                "width": {"type": "number", "description": "Normalized region width (0..1)."},
+                "height": {"type": "number", "description": "Normalized region height (0..1)."},
+                "value": {"type": "number", "description": "Numeric value for scale/rotation/opacity/adjustments."},
+                "delta_x": {"type": "number", "description": "Normalized horizontal movement delta (-1..1) for moving editable sketch strokes."},
+                "delta_y": {"type": "number", "description": "Normalized vertical movement delta (-1..1) for moving editable sketch strokes."},
+                "ratio": {"type": "string", "enum": ["free", "16:9", "9:16", "1:1", "4:3", "3:4"]},
+                "shape": {"type": "string", "enum": ["rectangle", "circle"], "description": "Region shape."}
+            },
+            "required": ["action"],
+            "additionalProperties": False
+        }
+    },
+    {
+        "type": "function",
         "name": "once_generate_draft",
-        "description": "Make exactly one incremental rough visual pass while preserving all unmentioned structure. Never use as a one-shot finished-image generator.",
+        "description": "Make exactly one incremental rough LINE pass while preserving all unmentioned structure. The app converts the result into editable PencilKit strokes. Use sparse line art and never output a one-shot finished full-color frame.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1129,7 +1162,7 @@ async def once_live(client_socket: WebSocket):
                                 if output_item.get("type") == "function_call":
                                     name = str(output_item.get("name") or "")
                                     call_id = str(output_item.get("call_id") or "")
-                                    if name in {"once_canvas_blocking", "once_generate_draft", "once_render_image"} and call_id:
+                                    if name in {"once_canvas_blocking", "once_edit_canvas", "once_generate_draft", "once_render_image"} and call_id:
                                         raw_arguments = output_item.get("arguments") or "{}"
                                         try:
                                             arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
