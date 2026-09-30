@@ -11,7 +11,7 @@ import httpx
 import websockets
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Once AI Backend", version="0.4.0")
+app = FastAPI(title="Once AI Backend", version="0.4.1")
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # Cost-aware model split.
@@ -29,10 +29,13 @@ RENDER_IMAGE_MODEL = os.environ.get("ONCE_RENDER_IMAGE_MODEL", "gpt-image-2.5-su
 
 # Original 2D action-animation baseline for Once. Keep this descriptive rather than copying any named frame.
 ONCE_VISUAL_BASELINE = (
-    "Original stylized 2D action-animation aesthetic: clean bold linework, flat cel shading, "
-    "expressive silhouettes, dynamic motion, readable staging, cinematic composition, restrained texture, "
-    "and simplified backgrounds when speed or action is the focus. Preserve character identity and continuity. "
-    "Do not copy existing copyrighted characters, logos, subtitles, or exact frames."
+    "MANDATORY Once visual language for generated artwork: original hand-drawn 2D action-animation frame, "
+    "bold clean black contours with slightly rough expressive linework, simplified flat cel shading, high-contrast graphic shapes, "
+    "limited controlled color, exaggerated readable action posing, strong foreshortening, speed lines and motion accents when appropriate. "
+    "Avoid photorealism, 3D/CG rendering, glossy game-cinematic rendering, painterly concept-art texture, and generic high-detail illustration. "
+    "The result should feel designed for an animated sequence and remain editable from pass to pass. "
+    "Preserve character identity, staging, camera direction, and continuity once the user has established them. "
+    "Do not copy existing copyrighted characters, logos, subtitles, or exact frames; create original characters while preserving these visual traits."
 )
 
 
@@ -386,7 +389,7 @@ def root():
         "service": "once-ai-backend",
         "story_context": "v1.5-companion-router",
         "router": "heuristic-v2-sticky",
-        "project_layer": "m13.1-shot-screenplay-edit-sync",
+        "project_layer": "m14.19-progressive-cocreate",
     }
 
 
@@ -407,7 +410,7 @@ def health():
         "live_model": LIVE_MODEL,
         "draft_image_model": DRAFT_IMAGE_MODEL,
         "render_image_model": RENDER_IMAGE_MODEL,
-        "project_prepare": "v2.1-shot-screenplay-edit-sync",
+        "project_prepare": "v2.2-progressive-cocreate",
     }
 
 
@@ -691,6 +694,7 @@ class ImageRequest(BaseModel):
     project_brief: dict | None = None
     reference_image_base64: str | None = None
     mask_image_base64: str | None = None
+    pass_type: Literal["blocking", "pose", "shape", "environment", "style_draft", "finish"] = "blocking"
     size: str = "1536x1024"
     quality: Literal["low", "medium", "high", "xhigh", "max", "auto"] = "auto"
     output_format: Literal["png", "jpeg", "webp"] = "png"
@@ -726,19 +730,56 @@ def _image_prompt(body: ImageRequest, stage: str) -> str:
     brief = ""
     if body.project_brief:
         brief = trim_text(json.dumps(body.project_brief, ensure_ascii=False), 14000)
+
+    pass_rules = {
+        "blocking": (
+            "BLOCKING PASS ONLY. Produce an intentionally incomplete structural sketch, not a finished picture. "
+            "Use sparse monochrome or near-monochrome lines, simple mannequin/stick-figure or silhouette placement, basic horizon/camera guides, and motion arrows if useful. "
+            "Do NOT add a rendered background, detailed costume, polished face, lighting, materials, atmospheric effects, or full color unless the user explicitly asked for that exact element. "
+            "The purpose is only to establish camera, framing, character count, relative positions, scale, facing direction, and movement."
+        ),
+        "pose": (
+            "POSE PASS ONLY. Work from the existing reference and improve only gesture, body direction, weight, action clarity, spacing, and motion. "
+            "Preserve camera and staging. Keep the image visibly rough and sketch-like. Do not add a finished background, detailed costume, or polish unless explicitly requested."
+        ),
+        "shape": (
+            "CHARACTER SHAPE PASS ONLY. Preserve the locked camera, staging, and poses. Add only readable character silhouettes, clothing masses, hair shapes, props, and large design forms requested by the user. "
+            "Keep linework draft-like; do not silently add environment detail or final lighting."
+        ),
+        "environment": (
+            "ENVIRONMENT PASS ONLY. Preserve all established people, poses, camera, scale, and spatial relationships. Add only the requested environment/background elements around them. "
+            "Do not redesign characters or move them unless the user explicitly asks."
+        ),
+        "style_draft": (
+            "STYLE DRAFT PASS ONLY. Preserve all established structure. Translate the existing rough image into Once's mandatory 2D action-animation visual language while keeping it visibly unfinished and easy to revise. "
+            "Do not turn it into a polished final illustration."
+        ),
+        "finish": (
+            "FINISH PASS. This pass is allowed only after the user has explicitly approved the established shot and asked to refine/finish it. "
+            "Preserve camera, composition, pose, character identity, scene layout, and all locked decisions. Improve linework, cel shading, color consistency, lighting and finish without redesigning or adding new story content."
+        ),
+    }
+    pass_instruction = pass_rules.get(body.pass_type, pass_rules["blocking"])
+
     if stage == "draft":
         stage_instruction = (
-            "This is the DRAFT ENGINE. Prioritize camera, composition, pose, silhouette, action readability, facial intent, and spatial relationships. "
-            "It may look unfinished. Do not waste detail on polishing. Give the user something structurally useful to discuss and revise."
+            "This is Once's INCREMENTAL DRAFT ENGINE. Never try to complete the whole image in one pass. "
+            "Only perform the current requested pass and leave everything else intentionally unresolved. "
+            "If a reference image exists, treat it as the user's current working state: preserve all unmentioned parts and change only what the user asked to change. "
+            + pass_instruction
         )
     else:
         stage_instruction = (
-            "This is the RENDER ENGINE. Preserve any established camera, composition, pose, character identity, scene layout, and locked story intent. "
-            "Improve linework, cel shading, lighting, materials, facial precision, and finish without silently redesigning the scene."
+            "This is Once's FINAL/REFINEMENT ENGINE. It must not invent a new composition. "
+            "Use the reference as the source of truth and preserve all previously approved decisions. "
+            + pass_instruction
         )
+
     return (
         ONCE_VISUAL_BASELINE + "\n\n" + stage_instruction +
+        "\n\nNON-NEGOTIABLE CO-CREATION RULE: user decisions outrank model taste. Do not improve, fill, beautify, or complete parts the user did not ask you to touch." +
         ("\n\nPROJECT BRIEF:\n" + brief if brief else "") +
+        "\n\nCURRENT PASS: " + body.pass_type +
         "\n\nUSER IMAGE REQUEST:\n" + body.prompt
     )
 
@@ -833,55 +874,99 @@ def image_render(body: ImageRequest):
 # ---------- GPT-Live 1 relay ----------
 
 LIVE_PROMPT = (
-    "You are Once in realtime voice mode, a calm and sharp creative partner working beside the user on an original 2D animation project. "
-    "Speak naturally and briefly. Listen before taking over. Have opinions when they help, but never silently change established story canon. "
+    "You are Once in realtime voice mode, a calm and sharp creative partner physically working beside the user on an original 2D animation shot. "
+    "The user is the director. The user owns camera structure, staging, character positions, action direction, pacing, and what gets added next. Your job is to help make those decisions visible step by step, not to finish the shot for them. "
+    "Speak naturally and briefly. Listen before taking over. Have opinions when useful, but suggestions are only suggestions until the user accepts them. "
+    "CO-CREATION DEFAULT: never jump from an idea to a complete image. Build in small passes: blocking/staging -> pose/action -> character shapes -> environment -> style draft -> finish. A pass may deliberately contain only lines, circles, stick figures, silhouettes, arrows, or three rough character positions with no background. Incompleteness is correct. "
+    "Before the FIRST visual action in a shot, or before advancing to a new pass, briefly say exactly what you plan to add and ask for the user's confirmation. Do not call a visual tool in that same turn unless the user already explicitly approved that exact step (for example: '就这样画', '开始', '按这个来'). "
+    "Within an already approved pass, direct corrections such as '男主再往右一点' or 'A再靠后' may be executed immediately without repeatedly asking. "
+    "For instant structural marks such as a circle, line, arrow, box, rough person position, or simple staging layout, use the fast canvas blocking action instead of an image model. "
+    "For image-model work, first passes must stay rough and incomplete. Never add a detailed background, full costume, polished lighting, or complete render unless the user explicitly asks for that stage. "
+    "Never use the final render action for a blank shot. Only use it after a visual has already been built progressively and the user explicitly asks to finish/refine/render it. "
+    "MANDATORY visual direction whenever an image model is used: original hand-drawn 2D action-animation look, bold black contours, slightly rough expressive lines, flat simplified cel shading, high-contrast graphic shapes, dynamic action posing and motion accents; no photorealism, no 3D/CG, no glossy cinematic concept-art look. "
     "When the user is actively drawing or revising a shot, talk about the current creative problem rather than lecturing about theory. "
     "Backchannel policy: short natural acknowledgements are allowed when useful; do not fill every silence. "
-    "Interruption policy: stop cleanly when the user interrupts and follow their newest correction. "
-    "Delegation policy: delegate when deeper reasoning is useful, and ALWAYS delegate when the user asks you to actually draw, generate, revise, repaint, or polish the current image. "
-    "The backend has two visual actions: a fast draft action for composition/pose/camera exploration, and a render action for preserving an established image while refining it. "
-    "Never claim an image was changed until the delegated tool result confirms it."
+    "Interruption policy: stop cleanly when the user interrupts and follow the newest correction. "
+    "Delegation policy: delegate when a visual action is actually needed. Never claim an image or canvas changed until the delegated tool result confirms it."
 )
 
 LIVE_BACKEND_PROMPT = (
     SYSTEM_PROMPT
-    + "\n\nYou are the backend agent for Once Live inside a 2D animation workspace. "
-      "When the user explicitly wants a visual action, use exactly one of the visual functions. "
-      "Use once_generate_draft for a first image, rough composition, pose, camera, blocking, or structural revision. "
-      "Use once_render_image only when the user wants refinement, cleanup, detail, finish, or preservation of an already established visual. "
-      "The app supplies the current screenplay and selected shot as context. Keep the prompt concrete and visual. "
-      "Do not call a visual function for ordinary discussion. Never report success before the function result says it succeeded."
+    + "\n\nYou are the backend action planner for Once Live inside a 2D animation workspace. "
+      "The user is the director; never seize authorship of composition or staging. The operating mode is progressive co-creation, not one-shot generation. "
+      "The valid visual progression is blocking -> pose -> shape -> environment -> style_draft -> finish, but the user may pause, revise, or skip a stage explicitly. "
+      "For circles, lines, arrows, boxes, rough character positions, or first-pass staging, prefer once_canvas_blocking because it is immediate and editable. "
+      "Use once_generate_draft only for the single requested visual pass. Always set pass_type to the narrowest stage that matches the user's current approved request. "
+      "Use once_render_image only for finish/refinement AFTER a prior visual exists AND the user's latest message explicitly asks to finish, polish, refine, or render. Never render a blank shot. "
+      "Do not bundle multiple stages into one call. If the user asks only for three rough positions with no background, the tool prompt must explicitly say no background and no added detail. "
+      "Preserve every unmentioned part of the current reference. Do not add background, costume detail, props, lighting, color, or new characters unless the user requested that exact addition. "
+      "Before a first visual action or a stage advance, the realtime partner must have already obtained user confirmation. If that confirmation is absent or ambiguous, do not call a visual function; answer conversationally and ask the smallest useful confirmation question. "
+      "The app supplies the current screenplay, selected shot, and current visual status as context. Keep every tool prompt concrete, literal, visual, and narrow. "
+      "Never report success before the function result says it succeeded."
 )
 
 LIVE_VISUAL_TOOLS = [
     {
         "type": "function",
-        "name": "once_generate_draft",
-        "description": "Generate or revise a rough draft image for the current animation shot. Use for composition, camera, pose, action blocking, silhouette, or a first visual attempt.",
+        "name": "once_canvas_blocking",
+        "description": "Instantly place simple editable blocking marks on the current canvas. Use for circles, lines, arrows, boxes, rough stick-figure positions, movement paths, and first-pass staging. Prefer this over an image model whenever the user is still deciding structure.",
         "parameters": {
             "type": "object",
             "properties": {
-                "prompt": {"type": "string", "description": "Concrete visual instruction for the draft image."},
                 "shot_number": {"type": "integer", "description": "Optional 1-based screenplay shot number to target."},
+                "clear_existing": {"type": "boolean", "description": "Clear existing AI blocking marks before applying these marks. Use only when the user asks to restart/rebuild the blocking."},
+                "marks": {
+                    "type": "array",
+                    "maxItems": 32,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["line", "arrow", "circle", "box", "stick_figure"]},
+                            "x": {"type": "number", "minimum": 0, "maximum": 1, "description": "Normalized start/center X."},
+                            "y": {"type": "number", "minimum": 0, "maximum": 1, "description": "Normalized start/center Y."},
+                            "x2": {"type": "number", "minimum": 0, "maximum": 1, "description": "Normalized end X for line/arrow/box."},
+                            "y2": {"type": "number", "minimum": 0, "maximum": 1, "description": "Normalized end Y for line/arrow/box."},
+                            "size": {"type": "number", "minimum": 0.02, "maximum": 0.5, "description": "Normalized size/radius for circle or stick figure."}
+                        },
+                        "required": ["kind", "x", "y"],
+                        "additionalProperties": False
+                    }
+                }
             },
-            "required": ["prompt"],
-            "additionalProperties": False,
-        },
+            "required": ["marks"],
+            "additionalProperties": False
+        }
+    },
+    {
+        "type": "function",
+        "name": "once_generate_draft",
+        "description": "Make exactly one incremental rough visual pass while preserving all unmentioned structure. Never use as a one-shot finished-image generator.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Narrow literal instruction for only this pass. Explicitly state what must NOT be added when relevant."},
+                "pass_type": {"type": "string", "enum": ["blocking", "pose", "shape", "environment", "style_draft"], "description": "The one incremental pass to perform."},
+                "shot_number": {"type": "integer", "description": "Optional 1-based screenplay shot number to target."}
+            },
+            "required": ["prompt", "pass_type"],
+            "additionalProperties": False
+        }
     },
     {
         "type": "function",
         "name": "once_render_image",
-        "description": "Refine or finish the current shot image while preserving established composition, identity, pose, and story intent.",
+        "description": "Finish/refine an already established shot only after explicit user approval. Never use on a blank shot or to invent a new composition.",
         "parameters": {
             "type": "object",
             "properties": {
-                "prompt": {"type": "string", "description": "Concrete visual refinement instruction."},
-                "shot_number": {"type": "integer", "description": "Optional 1-based screenplay shot number to target."},
+                "prompt": {"type": "string", "description": "Concrete refinement instruction that preserves all approved structure."},
+                "pass_type": {"type": "string", "enum": ["finish"], "description": "Must be finish."},
+                "shot_number": {"type": "integer", "description": "Optional 1-based screenplay shot number to target."}
             },
-            "required": ["prompt"],
-            "additionalProperties": False,
-        },
-    },
+            "required": ["prompt", "pass_type"],
+            "additionalProperties": False
+        }
+    }
 ]
 
 
@@ -1044,7 +1129,7 @@ async def once_live(client_socket: WebSocket):
                                 if output_item.get("type") == "function_call":
                                     name = str(output_item.get("name") or "")
                                     call_id = str(output_item.get("call_id") or "")
-                                    if name in {"once_generate_draft", "once_render_image"} and call_id:
+                                    if name in {"once_canvas_blocking", "once_generate_draft", "once_render_image"} and call_id:
                                         raw_arguments = output_item.get("arguments") or "{}"
                                         try:
                                             arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
