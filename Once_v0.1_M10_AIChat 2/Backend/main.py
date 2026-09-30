@@ -11,7 +11,7 @@ import httpx
 import websockets
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Once AI Backend", version="0.4.1")
+app = FastAPI(title="Once AI Backend", version="0.4.2")
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # Cost-aware model split.
@@ -687,6 +687,75 @@ def sync_edited_screenplay(body: ProjectScreenplaySyncRequest):
     }
 
 
+
+# ---------- Canvas vision bridge ----------
+
+class CanvasInspectRequest(BaseModel):
+    image_base64: str = Field(min_length=16)
+    selection_mask_base64: str | None = None
+    hint: str = Field(default="", max_length=4000)
+
+
+@app.post("/once/canvas/inspect")
+def inspect_canvas(body: CanvasInspectRequest):
+    """Give Once Live semantic sight of the user's current drawing without changing it."""
+    if not os.environ.get("OPENAI_API_KEY"):
+        raise HTTPException(status_code=500, detail="Render 缺少 OPENAI_API_KEY")
+
+    image = _decode_image(body.image_base64, "画布截图")
+    if not image:
+        raise HTTPException(status_code=400, detail="画布截图为空")
+    image_url = "data:image/png;base64," + base64.b64encode(image).decode("ascii")
+
+    content: list[dict] = [
+        {
+            "type": "input_text",
+            "text": (
+                "You are Once's canvas vision bridge. Look at the user's CURRENT animation canvas and report only visible, useful facts for continuing the edit. "
+                "Treat hand-drawn strokes, rough stick figures, arrows, blocking marks and incomplete lines as intentional creative input, not mistakes. "
+                "Do not invent story facts. Describe character count/placement, rough pose/action, composition, major visible background elements, and any obvious user annotations. "
+                "If the user hint refers to 'this/这里/这个/我画的', resolve it from the image as best you can. "
+                "Be concise and concrete. User hint: " + trim_text(body.hint, 3000)
+            ),
+        },
+        {"type": "input_image", "image_url": image_url, "detail": "high"},
+    ]
+
+    if body.selection_mask_base64:
+        mask = _decode_image(body.selection_mask_base64, "选区图")
+        if mask:
+            mask_url = "data:image/png;base64," + base64.b64encode(mask).decode("ascii")
+            content.extend([
+                {
+                    "type": "input_text",
+                    "text": (
+                        "The next image is the user's active edit-selection mask. Focus especially on the selected area. "
+                        "The transparent/dark cleared area indicates what the user selected; the rest is protected."
+                    ),
+                },
+                {"type": "input_image", "image_url": mask_url, "detail": "high"},
+            ])
+
+    try:
+        response = client.responses.create(
+            model=CONTEXT_MODEL,
+            reasoning={"effort": "none"},
+            instructions=(
+                "Return a compact visual description for another realtime model. "
+                "Do not give advice unless the hint asks for it. Never claim to have edited the canvas."
+            ),
+            input=[{"role": "user", "content": content}],
+            store=False,
+            max_output_tokens=450,
+        )
+        summary = (response.output_text or "").strip()
+        if not summary:
+            raise RuntimeError("视觉模型没有返回描述")
+        return {"ok": True, "model": CONTEXT_MODEL, "summary": summary}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="画布理解失败：" + str(exc)) from exc
+
+
 # ---------- GPT Image 2.5 ----------
 
 class ImageRequest(BaseModel):
@@ -881,7 +950,10 @@ LIVE_PROMPT = (
     "Before the FIRST visual action in a shot, or before advancing to a new pass, briefly say exactly what you plan to add and ask for the user's confirmation. Do not call a visual tool in that same turn unless the user already explicitly approved that exact step (for example: '就这样画', '开始', '按这个来'). "
     "Within an already approved pass, direct corrections such as '男主再往右一点' or 'A再靠后' may be executed immediately without repeatedly asking. "
     "For instant structural marks such as a circle, line, arrow, box, rough person position, or simple staging layout, use the fast canvas blocking action instead of an image model. "
-    "For DIRECT EDITS of the existing canvas—delete/erase, move, resize, rotate, change opacity, switch horizontal/vertical ratio, make a region darker/brighter, or clear a layer—use once_edit_canvas immediately. These are canvas operations, not image-generation requests. If the user explicitly says '删掉这个/往左一点/改横屏/这里暗一点', do the edit instead of telling them to do it manually. "
+    "The user's pencil and eraser always remain primary controls, even while Live is connected. Never ask the user to switch into an AI-only drawing layer. AI draft strokes and user strokes share the same editable canvas. "
+    "If the user refers to what they drew, points with '这个/这里', or asks you to understand an ambiguous hand-drawn mark, call once_inspect_canvas before deciding what it is. This lets you combine their spoken intent with what is visibly on the canvas. "
+    "When the user has painted or circled an AI edit region, use once_region_edit for semantic local changes such as '把这撮头发变白' or '删掉我涂的那座山'. The selected region is authoritative: change only that region and preserve everything outside it. "
+    "For non-generative canvas controls such as aspect ratio, global brightness/contrast/saturation/exposure, local brightness, background mode, or clearing the whole visual state, use once_edit_canvas. "
     "For image-model work, every draft pass is converted by the app into editable PencilKit strokes. Draft outputs must therefore be line-first, sparse, rough and incomplete: no full-color finished frame, no polished lighting, no photorealistic or rendered background. Never add a detailed background, full costume, polished lighting, or complete render unless the user explicitly asks for that stage. "
     "Never use the final render action for a blank shot. Only use it after a visual has already been built progressively and the user explicitly asks to finish/refine/render it. "
     "MANDATORY visual direction whenever an image model is used: original hand-drawn 2D action-animation look, bold black contours, slightly rough expressive lines, flat simplified cel shading, high-contrast graphic shapes, dynamic action posing and motion accents; no photorealism, no 3D/CG, no glossy cinematic concept-art look. "
@@ -897,7 +969,10 @@ LIVE_BACKEND_PROMPT = (
       "The user is the director; never seize authorship of composition or staging. The operating mode is progressive co-creation, not one-shot generation. "
       "The valid visual progression is blocking -> pose -> shape -> environment -> style_draft -> finish, but the user may pause, revise, or skip a stage explicitly. "
       "For circles, lines, arrows, boxes, rough character positions, or first-pass staging, prefer once_canvas_blocking because it is immediate and editable. "
-      "For edits to existing canvas state, prefer once_edit_canvas over any image model. The draft layer is editable PencilKit stroke data, not a photo: you can erase/move/scale a region of those strokes. The final render, if one exists, is a separate raster layer that can also be moved/scaled/rotated/erased. You can change canvas ratio/orientation, global adjustments, and local brightness. Never answer '你自己删/你自己改' when a supported canvas edit exists. "
+      "User and AI draft strokes share one editable PencilKit canvas. The same normal pencil and eraser are always available to the user; there is no separate AI move/scale/delete workflow. "
+      "If the user refers to their own drawing or an ambiguous visible element, call once_inspect_canvas to inspect the current composite before acting. "
+      "If the user has an active painted/circled region, use once_region_edit for semantic local edits and preserve every pixel outside the selected region. "
+      "Use once_edit_canvas only for non-generative controls such as aspect ratio/orientation, global adjustments, local brightness, backgrounds, or clearing visual state. Never answer '你自己删/你自己改' when Once can perform the requested supported operation. "
       "Use once_generate_draft only for the single requested visual pass. Always set pass_type to the narrowest stage that matches the user's current approved request. "
       "Use once_render_image only for finish/refinement AFTER a prior visual exists AND the user's latest message explicitly asks to finish, polish, refine, or render. Never render a blank shot. "
       "Do not bundle multiple stages into one call. If the user asks only for three rough positions with no background, the tool prompt must explicitly say no background and no added detail. "
@@ -941,28 +1016,52 @@ LIVE_VISUAL_TOOLS = [
     },
     {
         "type": "function",
+        "name": "once_inspect_canvas",
+        "description": "Look at the user's current composite canvas so you can understand their hand-drawn strokes, rough blocking, selected area, and visible scene before responding or editing. Use when the user says this/here/what I drew or when visual meaning is ambiguous.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Short question/hint about what you need to understand from the canvas."},
+                "shot_number": {"type": "integer", "description": "Optional 1-based screenplay shot number."}
+            },
+            "additionalProperties": False
+        }
+    },
+    {
+        "type": "function",
+        "name": "once_region_edit",
+        "description": "Edit ONLY the user's active painted/circled region using the current canvas as reference. Use for semantic local changes such as recolor a selected lock of hair, remove a selected mountain, redraw a selected hand, or change one selected detail. Never change outside the selected region.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Literal requested change for the selected region only."},
+                "shot_number": {"type": "integer", "description": "Optional 1-based screenplay shot number."}
+            },
+            "required": ["prompt"],
+            "additionalProperties": False
+        }
+    },
+    {
+        "type": "function",
         "name": "once_edit_canvas",
-        "description": "Directly edit the current editable canvas state without generating a new image. Drafts are editable PencilKit strokes: erase/move/scale them by region. Final raster layers can also be erased/moved/scaled/rotated. Use this for explicit user corrections immediately.",
+        "description": "Non-generative controls for the whole workspace: aspect ratio/orientation, global image adjustments, local brightness, backgrounds, or clearing visual state. Do not use this for semantic object edits; use once_region_edit for selected-area changes.",
         "parameters": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
                     "enum": [
-                        "erase_ai_region", "clear_ai_image", "clear_editable_sketch", "erase_sketch_region", "move_sketch_region", "scale_sketch_region", "clear_blocking", "clear_user_drawing", "clear_all_visuals",
-                        "move_ai_image", "scale_ai_image", "rotate_ai_image", "set_ai_opacity", "set_aspect_ratio",
-                        "set_brightness", "set_contrast", "set_saturation", "set_exposure", "local_brightness",
-                        "clear_local_adjustments", "set_background_black", "set_background_transparent"
+                        "clear_blocking", "clear_user_drawing", "clear_all_visuals",
+                        "set_aspect_ratio", "set_brightness", "set_contrast", "set_saturation", "set_exposure",
+                        "local_brightness", "clear_local_adjustments", "set_background_black", "set_background_transparent"
                     ]
                 },
                 "shot_number": {"type": "integer", "description": "Optional 1-based screenplay shot number."},
-                "x": {"type": "number", "description": "Normalized center X (0..1) for move or region operations."},
-                "y": {"type": "number", "description": "Normalized center Y (0..1) for move or region operations."},
+                "x": {"type": "number", "description": "Normalized center X (0..1) for local brightness."},
+                "y": {"type": "number", "description": "Normalized center Y (0..1) for local brightness."},
                 "width": {"type": "number", "description": "Normalized region width (0..1)."},
                 "height": {"type": "number", "description": "Normalized region height (0..1)."},
-                "value": {"type": "number", "description": "Numeric value for scale/rotation/opacity/adjustments."},
-                "delta_x": {"type": "number", "description": "Normalized horizontal movement delta (-1..1) for moving editable sketch strokes."},
-                "delta_y": {"type": "number", "description": "Normalized vertical movement delta (-1..1) for moving editable sketch strokes."},
+                "value": {"type": "number", "description": "Numeric value for adjustments."},
                 "ratio": {"type": "string", "enum": ["free", "16:9", "9:16", "1:1", "4:3", "3:4"]},
                 "shape": {"type": "string", "enum": ["rectangle", "circle"], "description": "Region shape."}
             },
