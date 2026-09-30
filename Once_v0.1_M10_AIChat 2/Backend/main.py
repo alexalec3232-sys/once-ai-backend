@@ -11,7 +11,7 @@ import httpx
 import websockets
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Once AI Backend", version="0.3.0")
+app = FastAPI(title="Once AI Backend", version="0.4.0")
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # Cost-aware model split.
@@ -838,8 +838,51 @@ LIVE_PROMPT = (
     "When the user is actively drawing or revising a shot, talk about the current creative problem rather than lecturing about theory. "
     "Backchannel policy: short natural acknowledgements are allowed when useful; do not fill every silence. "
     "Interruption policy: stop cleanly when the user interrupts and follow their newest correction. "
-    "Delegation policy: use the Responses backend for reasoning-heavy story questions. The visual renderer is controlled by the Once application, not by pretending an image was created."
+    "Delegation policy: delegate when deeper reasoning is useful, and ALWAYS delegate when the user asks you to actually draw, generate, revise, repaint, or polish the current image. "
+    "The backend has two visual actions: a fast draft action for composition/pose/camera exploration, and a render action for preserving an established image while refining it. "
+    "Never claim an image was changed until the delegated tool result confirms it."
 )
+
+LIVE_BACKEND_PROMPT = (
+    SYSTEM_PROMPT
+    + "\n\nYou are the backend agent for Once Live inside a 2D animation workspace. "
+      "When the user explicitly wants a visual action, use exactly one of the visual functions. "
+      "Use once_generate_draft for a first image, rough composition, pose, camera, blocking, or structural revision. "
+      "Use once_render_image only when the user wants refinement, cleanup, detail, finish, or preservation of an already established visual. "
+      "The app supplies the current screenplay and selected shot as context. Keep the prompt concrete and visual. "
+      "Do not call a visual function for ordinary discussion. Never report success before the function result says it succeeded."
+)
+
+LIVE_VISUAL_TOOLS = [
+    {
+        "type": "function",
+        "name": "once_generate_draft",
+        "description": "Generate or revise a rough draft image for the current animation shot. Use for composition, camera, pose, action blocking, silhouette, or a first visual attempt.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Concrete visual instruction for the draft image."},
+                "shot_number": {"type": "integer", "description": "Optional 1-based screenplay shot number to target."},
+            },
+            "required": ["prompt"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "once_render_image",
+        "description": "Refine or finish the current shot image while preserving established composition, identity, pose, and story intent.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Concrete visual refinement instruction."},
+                "shot_number": {"type": "integer", "description": "Optional 1-based screenplay shot number to target."},
+            },
+            "required": ["prompt"],
+            "additionalProperties": False,
+        },
+    },
+]
 
 
 def _live_initial_input(project_context: str, history: list[dict]) -> list[dict]:
@@ -904,7 +947,10 @@ async def once_live(client_socket: WebSocket):
                         "type": "responses",
                         "responses": {
                             "model": LUNA_MODEL,
-                            "instructions": SYSTEM_PROMPT,
+                            "instructions": LIVE_BACKEND_PROMPT,
+                            "tools": LIVE_VISUAL_TOOLS,
+                            "tool_choice": "auto",
+                            "parallel_tool_calls": False,
                         },
                     },
                     "store": False,
@@ -927,6 +973,8 @@ async def once_live(client_socket: WebSocket):
                 if event_type == "error":
                     await client_socket.send_json({"type": "error", "message": str(event.get("error") or event)})
 
+            pending_visual_calls: dict[str, dict] = {}
+
             async def client_to_openai():
                 try:
                     while True:
@@ -944,9 +992,28 @@ async def once_live(client_socket: WebSocket):
                             await upstream.send(json.dumps({"type": "session.input_audio.unmute"}))
                         elif kind == "context" and item.get("content"):
                             await upstream.send(json.dumps({
-                                "type": "session.instructions.append",
+                                "type": "session.thinking.append",
+                                "event_id": "once_ui_context",
                                 "content": trim_text(str(item["content"]), 12000),
                                 "delegation_id": None,
+                            }, ensure_ascii=False))
+                        elif kind == "tool_result" and item.get("call_id"):
+                            call_id = str(item["call_id"])
+                            output = str(item.get("output") or '{"ok":false,"message":"missing tool result"}')
+                            await upstream.send(json.dumps({
+                                "type": "response.item.create",
+                                "event_id": "once_tool_result_" + call_id[-12:],
+                                "item": {
+                                    "type": "function_call_output",
+                                    "call_id": call_id,
+                                    "output": output,
+                                },
+                            }, ensure_ascii=False))
+                            pending_visual_calls.pop(call_id, None)
+                            await client_socket.send_json({"type": "phase", "phase": "thinking"})
+                            await upstream.send(json.dumps({
+                                "type": "response.create",
+                                "event_id": "once_continue_" + call_id[-12:],
                             }, ensure_ascii=False))
                         elif kind == "close":
                             await upstream.send(json.dumps({"type": "session.close"}))
@@ -965,6 +1032,45 @@ async def once_live(client_socket: WebSocket):
                             await client_socket.send_json({"type": "user_transcript", "delta": event.get("delta", "")})
                         elif kind == "session.output_transcript.delta":
                             await client_socket.send_json({"type": "assistant_transcript", "delta": event.get("delta", "")})
+                        elif kind == "session.delegation.created":
+                            await client_socket.send_json({"type": "phase", "phase": "thinking"})
+                        elif kind == "response.event":
+                            inner = event.get("event") if isinstance(event.get("event"), dict) else {}
+                            inner_kind = inner.get("type", "")
+                            delegation_id = str(event.get("delegation_id") or "")
+
+                            if inner_kind == "response.output_item.done":
+                                output_item = inner.get("item") if isinstance(inner.get("item"), dict) else {}
+                                if output_item.get("type") == "function_call":
+                                    name = str(output_item.get("name") or "")
+                                    call_id = str(output_item.get("call_id") or "")
+                                    if name in {"once_generate_draft", "once_render_image"} and call_id:
+                                        raw_arguments = output_item.get("arguments") or "{}"
+                                        try:
+                                            arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
+                                        except Exception:
+                                            arguments = {}
+                                        if not isinstance(arguments, dict):
+                                            arguments = {}
+                                        pending_visual_calls[call_id] = {
+                                            "delegation_id": delegation_id,
+                                            "name": name,
+                                        }
+                                        await client_socket.send_json({"type": "phase", "phase": "acting"})
+                                        await client_socket.send_json({
+                                            "type": "tool_request",
+                                            "call_id": call_id,
+                                            "name": name,
+                                            "arguments": arguments,
+                                        })
+
+                            elif inner_kind == "response.completed":
+                                has_pending = any(
+                                    meta.get("delegation_id") == delegation_id
+                                    for meta in pending_visual_calls.values()
+                                )
+                                if not has_pending:
+                                    await client_socket.send_json({"type": "phase", "phase": "listening"})
                         elif kind == "session.closed":
                             await client_socket.send_json({"type": "closed", "usage": event.get("usage")})
                             return
