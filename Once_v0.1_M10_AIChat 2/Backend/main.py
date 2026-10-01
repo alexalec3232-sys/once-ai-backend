@@ -1,4 +1,3 @@
-import json
 import os
 from typing import Literal
 
@@ -6,11 +5,11 @@ from fastapi import FastAPI, HTTPException
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Once AI Backend", version="0.5.0")
+app = FastAPI(title="Once AI Backend", version="0.6.0")
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 SOL_MODEL = os.environ.get("ONCE_SOL_MODEL", "gpt-5.6-sol")
-RECENT_MESSAGE_COUNT = int(os.environ.get("ONCE_RECENT_MESSAGE_COUNT", "40"))
+RECENT_MESSAGE_COUNT = int(os.environ.get("ONCE_RECENT_MESSAGE_COUNT", "60"))
 
 
 class ChatMessage(BaseModel):
@@ -19,28 +18,50 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    messages: list[ChatMessage] = Field(default_factory=list, max_length=120)
+    messages: list[ChatMessage] = Field(default_factory=list, max_length=160)
     creation_tools_enabled: bool = False
 
 
 SYSTEM_PROMPT = """
-You are Once, an AI creative partner for making original animated films.
+You are Once, an AI creative partner and director for original 2D anime-style films.
 
-The user owns the story and the creative decisions. Your job in this chat is to talk with them naturally, understand what they are trying to make, react intelligently, point out what is interesting or weak when useful, and help the idea become clearer without taking authorship away from them.
+PRODUCT BOUNDARIES
+- Once only makes original 2D anime / hand-drawn animation style work. Do not steer the project toward live action, photorealism, or 3D CGI production.
+- A single Once project may be as short as 5 seconds and at most 10 minutes (600 seconds).
+- The user owns the story and every creative decision. You may direct by default when the user leaves camera language unspecified, but any user-specified shot, composition, pace, action, sound, or edit takes priority.
+- Once should have strong default directing. If the user says only “three people chase the protagonist,” you should be capable of inventing a cinematic shot progression rather than forcing them to specify every camera angle.
 
-Do NOT behave like a form, onboarding flow, requirements collector, screenplay template, or project manager. Do NOT interrogate the user for every missing detail. A user should be able to begin with one rough sentence and simply talk with you. Respond like a strong creative partner, not like a semantic router.
+CHAT BEHAVIOR
+Talk naturally. Do not behave like a form, onboarding flow, semantic router, requirements collector, or project manager. Do not interrogate the user for every missing detail. One rough sentence is enough to begin.
 
-Do not force the conversation toward production too early. The user may want to keep exploring story, characters, tone, visual ideas, or individual moments for as long as they want.
+Discuss story, characters, tone, visual moments, pacing, and possible camera choices as a strong creative partner. Give useful opinions when appropriate, but never silently turn your own suggestion into canon. Keep established canon separate from your ideas.
 
-However, YOU are responsible for deciding when there is enough material to make a useful first screenplay and begin the video project. When you genuinely believe the current idea is coherent enough for a first production pass, you MAY proactively tell the user, naturally, that you think it is ready and that you can generate the screenplay and start making the video. Do not wait for a magic phrase from the user.
+Do not rush production. The user may brainstorm for as long as they want.
 
-When you make that readiness offer for the first time, call the hidden once_unlock_creation_tools function in the same response. The tool call is internal. Never mention tools, routing, classifiers, flags, APIs, or system state to the user. Your visible reply should remain normal conversation, for example a natural equivalent of: “我觉得现在已经差不多能开始了，我可以先把它整理成剧本，然后开始做视频。” Use your own wording based on context.
+READINESS
+You are responsible for recognizing when there is enough material for a useful first screenplay. If YOU independently think the project is ready, you may naturally say that it feels ready to turn into a screenplay and call once_unlock_creation_tools in the same response. This only means you are offering to proceed; it does not mean the user agreed.
 
-Calling once_unlock_creation_tools does NOT mean the user has agreed to start. It only means you have decided the project is ready enough that production tools can become available. The user still has full choice and may continue discussing instead.
+If the USER directly says it is time for the screenplay, asks you to begin, says “差不多了/可以来剧本了/开始吧”, or clearly accepts your readiness offer, do not ask for redundant confirmation. Call once_begin_video_project yourself in that turn. You may do this even if once_unlock_creation_tools was never called before.
 
-Once production tools are available, keep chatting normally. If the user clearly accepts, asks you to proceed, or directly asks you to generate/start, use the appropriate production tool yourself instead of asking for redundant confirmation. If they continue brainstorming, do not call a production tool merely because it exists.
+Never mention tools, routing, flags, hidden state, APIs, or model selection to the user.
 
-Keep CANON and your suggestions separate. Never silently turn your own idea into established story canon. Match the user's language and level of casualness. Prefer natural paragraphs. Do not end every reply with a question.
+SCREENPLAY RULES FOR once_begin_video_project
+When beginning production, generate a COMPLETE editable shot screenplay for the agreed production scope.
+- Preserve canon. Do not continue the plot beyond what the user established.
+- Use strong cinematic shot choices where the user did not specify them.
+- Write what can be seen or heard, not abstract literary analysis.
+- Make shots concrete enough for a video model and editor: subject/action, framing/camera behavior, approximate duration, important visual continuity, and important sound cues where relevant.
+- Fast inserts may be sub-second in the final edit (for example 0.5–0.8s), even though the underlying video model may later generate a longer source take and Once can retime/cut it.
+- The full estimated project duration must be between 5 and 600 seconds.
+- Do not embed prompt-engineering jargon or model names into the screenplay.
+- Background music is optional. Decide a sensible default, but the user will be able to toggle it on the screenplay review screen.
+
+The screenplay will be shown to the user on a dedicated review page before any paid video generation. They can edit it freely and then press Start Generation.
+
+LONG-FORM PRODUCTION MODEL
+Once does NOT wait for an entire long film to finish before showing anything. The production pipeline will later deliver roughly 2–3 minute production segments into a simple CapCut-like editor. A completed segment appears immediately while the next segment continues generating and shows live progress. Individual shots remain the smallest replaceable generation unit.
+
+Match the user's language and casualness. Prefer natural paragraphs in chat. Do not end every reply with a question.
 """.strip()
 
 
@@ -48,16 +69,15 @@ UNLOCK_TOOL = {
     "type": "function",
     "name": "once_unlock_creation_tools",
     "description": (
-        "Internally unlock Once's production tools. Call this exactly when you, Once, "
-        "independently judge that the user's current idea is coherent enough for a useful first screenplay/video pass "
-        "and you are naturally offering to begin production. This does not mean the user has accepted yet."
+        "Internally mark the story as ready enough for a first screenplay when Once independently decides to offer production. "
+        "This is only an offer and must not imply that the user accepted."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "reason": {
                 "type": "string",
-                "description": "A short internal reason why the project is ready enough for a first production pass."
+                "description": "Short internal reason the story is ready enough for a useful first screenplay."
             }
         },
         "required": ["reason"],
@@ -71,26 +91,47 @@ BEGIN_VIDEO_TOOL = {
     "type": "function",
     "name": "once_begin_video_project",
     "description": (
-        "Begin the screenplay-and-video project after production tools have been unlocked and the user has clearly "
-        "asked or agreed to proceed. This hands the established conversation to Once's future production pipeline."
+        "Create the complete editable shot screenplay after the user directly asks to proceed or clearly accepts Once's offer. "
+        "Do not call this merely because Once thinks the story is ready; user acceptance is required unless the user initiated production themselves."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "working_title": {
                 "type": "string",
-                "description": "Working project title if known; otherwise a short temporary title."
+                "description": "Working title if known, otherwise a short temporary title."
             },
-            "production_scope": {
+            "screenplay": {
                 "type": "string",
-                "description": "What part of the story should be turned into the first screenplay/video pass."
+                "description": (
+                    "Complete editable shot screenplay for the agreed scope. Use clear shot blocks with approximate durations, "
+                    "visible/audible action, camera/framing, continuity details, and important sound cues."
+                )
+            },
+            "estimated_duration_seconds": {
+                "type": "integer",
+                "minimum": 5,
+                "maximum": 600,
+                "description": "Estimated total finished duration in seconds. Must never exceed 600."
+            },
+            "background_music_default": {
+                "type": "boolean",
+                "description": "Whether background music should be enabled by default on the screenplay review page."
             },
             "director_notes": {
                 "type": "string",
-                "description": "Compact notes that matter for the first pass, using only established canon plus clearly labeled creative intent."
+                "description": (
+                    "Compact internal production notes: established visual rules, character continuity, pacing, and user-specified camera constraints."
+                )
             }
         },
-        "required": ["working_title", "production_scope", "director_notes"],
+        "required": [
+            "working_title",
+            "screenplay",
+            "estimated_duration_seconds",
+            "background_music_default",
+            "director_notes"
+        ],
         "additionalProperties": False,
     },
     "strict": True,
@@ -121,14 +162,13 @@ def fallback_visible_reply(messages: list[ChatMessage], unlocked_now: bool, acti
     extra_instruction = ""
     if unlocked_now:
         extra_instruction = (
-            "\nINTERNAL STATE: You have just decided this project is ready enough for a first production pass and "
-            "creation tools have been unlocked. Give the natural user-facing reply you intended: say that you think "
-            "it is ready enough and you can generate the screenplay and start the video. Do not say the user already agreed."
+            "\nINTERNAL STATE: You just decided this project is ready enough for a first screenplay. "
+            "Give the natural user-facing readiness offer you intended. Do not imply that production has started."
         )
     elif action_requested:
         extra_instruction = (
-            "\nINTERNAL STATE: The user's request to begin the video project has been accepted by the production pipeline. "
-            "Acknowledge this briefly and naturally without describing tools or backend state."
+            "\nINTERNAL STATE: The screenplay has been prepared and the app is opening the screenplay review page. "
+            "Acknowledge briefly and naturally. Do not discuss hidden tools or backend state."
         )
 
     second = client.responses.create(
@@ -137,7 +177,7 @@ def fallback_visible_reply(messages: list[ChatMessage], unlocked_now: bool, acti
         instructions=SYSTEM_PROMPT + extra_instruction,
         input=model_input(messages),
         store=False,
-        max_output_tokens=1000,
+        max_output_tokens=1200,
     )
     return (second.output_text or "").strip()
 
@@ -147,8 +187,11 @@ def health():
     return {
         "ok": True,
         "model": SOL_MODEL,
-        "chat_architecture": "sol-first-tool-driven-v1",
+        "chat_architecture": "sol-first-tool-driven-v2",
         "semantic_router": False,
+        "max_project_seconds": 600,
+        "production_segment_target_seconds": "120-180",
+        "video_engine": "not-wired-in-this-build",
     }
 
 
@@ -159,7 +202,9 @@ def once_chat(body: ChatRequest):
     if not body.messages:
         raise HTTPException(status_code=400, detail="没有收到对话内容")
 
-    tools = [BEGIN_VIDEO_TOOL] if body.creation_tools_enabled else [UNLOCK_TOOL]
+    # Sol is the first team. Both capabilities are visible to the model; the prompt, not a semantic router,
+    # decides whether to offer readiness or actually create the screenplay.
+    tools = [UNLOCK_TOOL, BEGIN_VIDEO_TOOL]
 
     try:
         response = client.responses.create(
@@ -171,7 +216,7 @@ def once_chat(body: ChatRequest):
             tool_choice="auto",
             parallel_tool_calls=False,
             store=False,
-            max_output_tokens=2400,
+            max_output_tokens=12000,
         )
 
         reply = (response.output_text or "").strip()
@@ -183,10 +228,12 @@ def once_chat(body: ChatRequest):
         action_requested = False
 
         for call in tool_calls:
-            if call["name"] == "once_unlock_creation_tools" and not creation_tools_enabled:
+            if call["name"] == "once_unlock_creation_tools":
+                if not creation_tools_enabled:
+                    unlocked_now = True
                 creation_tools_enabled = True
-                unlocked_now = True
-            elif call["name"] == "once_begin_video_project" and creation_tools_enabled:
+            elif call["name"] == "once_begin_video_project":
+                creation_tools_enabled = True
                 action_requests.append({
                     "name": call["name"],
                     "arguments_json": call["arguments_json"],
